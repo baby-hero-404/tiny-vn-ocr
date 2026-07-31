@@ -1,8 +1,11 @@
 """Unified OCR Engine combining RapidOCR primary and Tesseract fallback."""
 
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 import logging
 import numpy as np
+import cv2
+
+from src.preprocessing.filters import enhance_image_for_detection
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +25,8 @@ try:
 except Exception:
     HAS_PYTESSERACT = False
 
+_SHARED_VIETOCR_PREDICTOR = None
+_SHARED_RAPIDOCR_ENGINE = None
 
 class OCREngine:
     """Unified OCR Engine with primary ONNX RapidOCR and Tesseract fallback."""
@@ -41,19 +46,20 @@ class OCREngine:
 
     @property
     def rapidocr_engine(self):
-        """Lazy-load RapidOCR engine instance."""
-        if self._rapidocr is not None:
-            return self._rapidocr
+        """Lazy-load RapidOCR engine instance as a singleton."""
+        global _SHARED_RAPIDOCR_ENGINE
+        if _SHARED_RAPIDOCR_ENGINE is not None:
+            return _SHARED_RAPIDOCR_ENGINE
 
         if not self._rapidocr_initialized:
             if HAS_RAPIDOCR:
                 try:
-                    self._rapidocr = RapidOCR(**self._rapidocr_kwargs)
+                    _SHARED_RAPIDOCR_ENGINE = RapidOCR(**self._rapidocr_kwargs)
                 except Exception as e:
                     logger.warning(f"Failed to initialize RapidOCR: {e}")
-                    self._rapidocr = None
+                    _SHARED_RAPIDOCR_ENGINE = None
             self._rapidocr_initialized = True
-        return self._rapidocr
+        return _SHARED_RAPIDOCR_ENGINE
 
     @property
     def available_engines(self) -> Dict[str, bool]:
@@ -92,6 +98,180 @@ class OCREngine:
         except Exception as e:
             logger.debug(f"RapidOCR recognition failed: {e}")
             return "", 0.0
+
+    def recognize_lines(self, image: np.ndarray) -> List[str]:
+        """Extract full document text block using RapidOCR line detection."""
+        if not HAS_RAPIDOCR or not self.rapidocr_engine:
+            return []
+            
+        try:
+            result, _ = self.rapidocr_engine(image)
+            if not result:
+                return []
+
+            texts = []
+            for item in result:
+                if len(item) >= 3:
+                    text = str(item[1]).strip()
+                    if text:
+                        texts.append(text)
+
+            return texts
+        except Exception as e:
+            logger.debug(f"RapidOCR recognize_lines failed: {e}")
+            return []
+
+    def recognize_lines_vietocr(self, image: np.ndarray) -> List[str]:
+        """
+        2-Stage OCR Pipeline:
+        1. RapidOCR detects text bounding boxes (fast & accurate).
+        2. VietOCR (VGG_Seq2Seq) recognizes text from cropped boxes (handles diacritics perfectly).
+        """
+        if not HAS_RAPIDOCR or not self.rapidocr_engine:
+            return []
+            
+        try:
+            # Stage 1: Detection
+            result, _ = self.rapidocr_engine(image)
+            if not result:
+                return []
+
+            # Lazy load VietOCR as a singleton to save memory across instances
+            global _SHARED_VIETOCR_PREDICTOR
+            if _SHARED_VIETOCR_PREDICTOR is None:
+                import PIL
+                if not hasattr(PIL.Image, 'ANTIALIAS'):
+                    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
+                    
+                from vietocr.tool.predictor import Predictor
+                from vietocr.tool.config import Cfg
+                
+                config = Cfg.load_config_from_name('vgg_seq2seq')
+                config['cnn']['pretrained'] = False
+                config['device'] = 'cpu'
+                config['predictor']['beamsearch'] = False
+                _SHARED_VIETOCR_PREDICTOR = Predictor(config)
+            
+            self.vietocr_predictor = _SHARED_VIETOCR_PREDICTOR
+
+            from PIL import Image
+
+            texts = []
+            for item in result:
+                if len(item) >= 3:
+                    box = item[0] # [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+                    x_coords = [p[0] for p in box]
+                    y_coords = [p[1] for p in box]
+                    
+                    # Padding lớn hơn để giữ nguyên dấu tiếng Việt (dấu mũ, dấu sắc phía trên chữ)
+                    padding_y_top = 6
+                    padding_y_bottom = 4
+                    padding_x = 3
+                    
+                    xmin = max(0, int(min(x_coords)) - padding_x)
+                    xmax = min(image.shape[1], int(max(x_coords)) + padding_x)
+                    ymin = max(0, int(min(y_coords)) - padding_y_top)
+                    ymax = min(image.shape[0], int(max(y_coords)) + padding_y_bottom)
+                    
+                    if ymax > ymin and xmax > xmin:
+                        crop = image[ymin:ymax, xmin:xmax]
+                        
+                        # Apply Best Practice Preprocessing on the Crop before Recognition
+                        crop_enhanced = enhance_image_for_detection(crop)
+                        
+                        # Chuyển OpenCV BGR sang RGB cho PIL
+                        crop_rgb = cv2.cvtColor(crop_enhanced, cv2.COLOR_BGR2RGB)
+                        pil_img = Image.fromarray(crop_rgb)
+                        
+                        # Stage 2: Recognition
+                        text = self.vietocr_predictor.predict(pil_img)
+                        text = text.strip()
+                        if text:
+                            texts.append(text)
+
+            return texts
+        except Exception as e:
+            logger.error(f"VietOCR 2-stage recognition failed: {e}")
+            return self.recognize_lines(image)
+
+    def recognize_lines_vietocr_with_bboxes(self, image: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        2-Stage OCR Pipeline that returns text along with bounding boxes.
+        Returns a list of dicts: {"text": str, "bbox": [xmin, ymin, xmax, ymax], "center": [cx, cy]}
+        """
+        if not HAS_RAPIDOCR or not self.rapidocr_engine:
+            return []
+            
+        try:
+            # Stage 1: Detection
+            result, _ = self.rapidocr_engine(image)
+            if not result:
+                return []
+
+            # Lazy load VietOCR as a singleton
+            global _SHARED_VIETOCR_PREDICTOR
+            if _SHARED_VIETOCR_PREDICTOR is None:
+                import PIL
+                if not hasattr(PIL.Image, 'ANTIALIAS'):
+                    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
+                    
+                from vietocr.tool.predictor import Predictor
+                from vietocr.tool.config import Cfg
+                
+                config = Cfg.load_config_from_name('vgg_seq2seq')
+                config['cnn']['pretrained'] = False
+                config['device'] = 'cpu'
+                config['predictor']['beamsearch'] = False
+                _SHARED_VIETOCR_PREDICTOR = Predictor(config)
+                
+            self.vietocr_predictor = _SHARED_VIETOCR_PREDICTOR
+
+            from PIL import Image
+            elements = []
+            for item in result:
+                if len(item) >= 3:
+                    box = item[0] # [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+                    x_coords = [p[0] for p in box]
+                    y_coords = [p[1] for p in box]
+                    
+                    padding_y_top = 6
+                    padding_y_bottom = 4
+                    padding_x = 3
+                    
+                    xmin = max(0, int(min(x_coords)) - padding_x)
+                    xmax = min(image.shape[1], int(max(x_coords)) + padding_x)
+                    ymin = max(0, int(min(y_coords)) - padding_y_top)
+                    ymax = min(image.shape[0], int(max(y_coords)) + padding_y_bottom)
+                    
+                    if ymax > ymin and xmax > xmin:
+                        crop = image[ymin:ymax, xmin:xmax]
+                        crop_enhanced = enhance_image_for_detection(crop)
+                        crop_rgb = cv2.cvtColor(crop_enhanced, cv2.COLOR_BGR2RGB)
+                        pil_img = Image.fromarray(crop_rgb)
+                        
+                        text = self.vietocr_predictor.predict(pil_img)
+                        text = text.strip()
+                        if text:
+                            # Calculate tight bbox
+                            tight_xmin = min(x_coords)
+                            tight_xmax = max(x_coords)
+                            tight_ymin = min(y_coords)
+                            tight_ymax = max(y_coords)
+                            
+                            elements.append({
+                                "text": text,
+                                "bbox": [tight_xmin, tight_ymin, tight_xmax, tight_ymax],
+                                "center": [
+                                    (tight_xmin + tight_xmax) / 2,
+                                    (tight_ymin + tight_ymax) / 2
+                                ],
+                                "height": tight_ymax - tight_ymin
+                            })
+
+            return elements
+        except Exception as e:
+            logger.error(f"VietOCR 2-stage recognition with bboxes failed: {e}")
+            return []
 
     def recognize_tesseract(
         self,

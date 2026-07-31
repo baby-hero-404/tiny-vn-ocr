@@ -36,7 +36,8 @@ tiny-vn-ocr/
 Yêu cầu Python >= 3.9. Cài đặt các thư viện cần thiết:
 
 ```bash
-pip install -r requirements.txt
+uv venv
+uv pip install -r requirements.txt
 ```
 
 *(Tùy chọn)* Cài đặt Tesseract OCR nếu muốn sử dụng Tesseract làm engine fallback:

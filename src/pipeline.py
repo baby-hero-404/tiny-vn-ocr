@@ -48,45 +48,59 @@ class DocumentOCRPipeline:
         elif doc_key == "vehicle_registration_front":
             doc_key = "vehicle_registration"
 
-        # 1. Image alignment (ORB Homography)
-        aligned_image = align_document(image, template_image)
+        # Check if we should use full-image heuristic parsing for CCCD
+        if doc_key in ("cccd", "cccd_back"):
+            from src.postprocessing.parser import parse_document
+            
+            # 1. Full Image OCR to extract raw lines
+            # Sử dụng 2-stage OCR: RapidOCR (Detection) + VietOCR (Recognition) để giữ nguyên dấu Tiếng Việt
+            lines = self.ocr_engine.recognize_lines_vietocr(image)
+            engines_used = {"rapidocr"}
+            
+            extracted_fields = parse_document(lines, doc_key)
+            field_confidences = [0.9] * len(extracted_fields)  # dummy confidence for full image OCR
+        else:
+            # Fallback to old ROI extraction for other documents
+            # 1. Image alignment (ORB Homography)
+            aligned_image = align_document(image, template_image)
 
-        # 2. ROI Region Extraction
-        rois = self.roi_extractor.extract_rois(aligned_image, doc_key)
+            # 2. ROI Region Extraction
+            rois = self.roi_extractor.extract_rois(aligned_image, doc_key)
 
-        extracted_fields: Dict[str, Any] = {}
-        field_confidences = []
-        engines_used = set()
+            extracted_fields: Dict[str, Any] = {}
+            field_confidences = []
+            engines_used = set()
 
-        # 3. Process each field ROI crop
-        for field_name, crop in rois.items():
-            if crop is None or crop.size == 0:
-                continue
+            # 3. Process each field ROI crop
+            for field_name, crop in rois.items():
+                if crop is None or crop.size == 0:
+                    continue
 
-            # Preprocessing filter for OCR optimization
-            enhanced_crop = enhance_for_ocr(crop)
+                # Preprocessing filter for OCR optimization
+                enhanced_crop = enhance_for_ocr(crop)
 
-            # Dual OCR recognition
-            raw_text, conf, engine_name = self.ocr_engine.recognize(enhanced_crop, field_type=field_name)
+                # Dual OCR recognition
+                raw_text, conf, engine_name = self.ocr_engine.recognize(enhanced_crop, field_type=field_name)
 
-            if engine_name != "none":
-                engines_used.add(engine_name)
+                if engine_name != "none":
+                    engines_used.add(engine_name)
 
-            # Post-processing normalization
-            normalized_text = normalize_field(raw_text, field_type=field_name)
-            extracted_fields[field_name] = normalized_text
+                # Post-processing normalization
+                extracted_fields[field_name] = raw_text
 
-            if conf > 0:
-                field_confidences.append(conf)
+                if conf > 0:
+                    field_confidences.append(conf)
+
+        # Normalize extracted fields
+        validated_fields = {}
+        for k, v in extracted_fields.items():
+            validated_fields[k] = normalize_field(v, field_type=k)
 
         # Calculate overall confidence score
         overall_confidence = (
             sum(field_confidences) / len(field_confidences) if field_confidences else (0.8 if extracted_fields else 0.0)
         )
         overall_confidence = round(min(max(overall_confidence, 0.0), 1.0), 2)
-
-        # Format / validate with document schema if possible
-        validated_fields = extracted_fields.copy()
 
         # Construct primary engine metadata tag
         primary_engine_tag = "rapidocr" if "rapidocr" in engines_used else ("tesseract" if "tesseract" in engines_used else "rapidocr")

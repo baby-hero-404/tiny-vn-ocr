@@ -39,6 +39,7 @@ class CCCDFields(BaseModel):
     place_of_origin: Optional[str] = Field(None, description="Place of origin")
     place_of_residence: Optional[str] = Field(None, description="Place of residence")
     date_of_issue: Optional[str] = Field(None, description="Date of issue DD/MM/YYYY")
+    date_of_expiry: Optional[str] = Field(None, description="Date of expiry DD/MM/YYYY")
 
     @field_validator("id_number")
     @classmethod
@@ -48,13 +49,31 @@ class CCCDFields(BaseModel):
                 raise ValueError("ID number must be exactly 12 digits")
         return v
 
-    @field_validator("date_of_birth", "date_of_issue")
+    @field_validator("date_of_birth", "date_of_issue", "date_of_expiry")
     @classmethod
     def validate_date(cls, v: Optional[str]) -> Optional[str]:
         if v is not None and v != "":
             if not re.match(r"^\d{2}/\d{2}/\d{4}$", v):
                 raise ValueError("Date must be in DD/MM/YYYY format")
         return v
+
+
+class CCCDBackFields(BaseModel):
+    features: Optional[str] = Field(None, description="Personal identification features")
+    date_of_issue: Optional[str] = Field(None, description="Date of issue DD/MM/YYYY")
+    place_of_issue: Optional[str] = Field(None, description="Place of issue / Issuer")
+    date_of_expiry: Optional[str] = Field(None, description="Date of expiry DD/MM/YYYY (new-style Căn cước back)")
+    place_of_residence: Optional[str] = Field(None, description="Place of residence (new-style Căn cước back)")
+    place_of_birth: Optional[str] = Field(None, description="Place of birth registration (new-style Căn cước back)")
+
+    @field_validator("date_of_issue", "date_of_expiry")
+    @classmethod
+    def validate_date(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v != "":
+            if not re.match(r"^\d{2}/\d{2}/\d{4}$", v):
+                raise ValueError("Date must be in DD/MM/YYYY format")
+        return v
+
 
 
 class GPLXFields(BaseModel):

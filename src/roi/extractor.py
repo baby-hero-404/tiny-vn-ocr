@@ -7,14 +7,14 @@ import numpy as np
 # Normalized ROI coordinates (ymin, xmin, ymax, xmax) for supported document templates
 DOCUMENT_TEMPLATES: Dict[str, Dict[str, Tuple[float, float, float, float]]] = {
     "cccd": {
-        "id_number": (0.32, 0.35, 0.44, 0.85),
-        "full_name": (0.44, 0.35, 0.54, 0.90),
-        "date_of_birth": (0.54, 0.45, 0.62, 0.75),
-        "gender": (0.62, 0.35, 0.70, 0.50),
-        "nationality": (0.62, 0.70, 0.70, 0.95),
-        "place_of_origin": (0.70, 0.35, 0.78, 0.95),
-        "place_of_residence": (0.78, 0.35, 0.88, 0.95),
-        "date_of_issue": (0.88, 0.45, 0.96, 0.80),
+        "id_number": (0.30, 0.35, 0.46, 0.85),
+        "full_name": (0.42, 0.35, 0.56, 0.95),
+        "date_of_birth": (0.52, 0.45, 0.64, 0.75),
+        "gender": (0.60, 0.35, 0.72, 0.50),
+        "nationality": (0.60, 0.70, 0.72, 0.95),
+        "place_of_origin": (0.68, 0.35, 0.80, 0.95),
+        "place_of_residence": (0.76, 0.35, 0.90, 0.95),
+        "date_of_issue": (0.86, 0.45, 0.98, 0.80),
     },
     "driving_license": {
         "license_number": (0.22, 0.48, 0.32, 0.92),
@@ -36,6 +36,11 @@ DOCUMENT_TEMPLATES: Dict[str, Dict[str, Tuple[float, float, float, float]]] = {
         "chassis_number": (0.72, 0.30, 0.80, 0.90),
         "vehicle_type": (0.80, 0.30, 0.88, 0.75),
         "date_of_issue": (0.88, 0.45, 0.96, 0.85),
+    },
+    "cccd_back": {
+        "features": (0.20, 0.05, 0.50, 0.95),
+        "date_of_issue": (0.50, 0.40, 0.65, 0.95),
+        "place_of_issue": (0.65, 0.35, 0.95, 0.95),
     },
 }
 
