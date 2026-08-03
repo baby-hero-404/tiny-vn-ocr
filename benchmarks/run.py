@@ -33,6 +33,18 @@ def main():
         acc = stats["accuracy_percent"]
         cer = stats["cer_percent"]
         print(f"{i}. {method_name:30s} | Acc: {acc:5.1f}% | CER: {cer:5.1f}%")
+    
+    # Print field-wise accuracy for top method
+    if sorted_methods:
+        top_name, top_stats = sorted_methods[0]
+        field_acc = top_stats.get("field_accuracy", {})
+        if field_acc:
+            print(f"\n=== FIELD-WISE ACCURACY (top: {top_name}) ===")
+            for fname, fdata in sorted(field_acc.items()):
+                acc_pct = fdata["accuracy_percent"]
+                matches = fdata["exact_matches"]
+                total = fdata["total"]
+                print(f"  {fname:25s} | {acc_pct:5.1f}% ({matches}/{total})")
 
 if __name__ == "__main__":
     main()

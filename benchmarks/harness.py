@@ -8,7 +8,7 @@ from typing import Dict, List, Any
 from tqdm import tqdm
 
 from benchmarks.registry import get_all_methods
-from benchmarks.metrics import evaluate_predictions
+from benchmarks.metrics import evaluate_predictions, evaluate_field_wise, evaluate_critical_fields
 
 def discover_dataset(resources_dir: Path) -> List[Dict[str, Any]]:
     """
@@ -95,6 +95,8 @@ def run_benchmarks(resources_dir: str = "resources") -> Dict[str, Any]:
             processing_time_ms = (time.time() - start_time) * 1000
             
             total_fields, exact_matches, total_cer = evaluate_predictions(truth_fields, pred_fields, fields_to_check)
+            field_wise = evaluate_field_wise(truth_fields, pred_fields, fields_to_check)
+            is_critical_match = evaluate_critical_fields(truth_fields, pred_fields, ["id_number", "full_name", "date_of_birth"])
             
             results["evaluations"][method_name].append({
                 "image_name": img_path.name,
@@ -105,8 +107,10 @@ def run_benchmarks(resources_dir: str = "resources") -> Dict[str, Any]:
                     "total_fields": total_fields,
                     "exact_matches": exact_matches,
                     "total_cer": total_cer,
-                    "processing_time_ms": processing_time_ms
-                }
+                    "processing_time_ms": processing_time_ms,
+                    "is_critical_match": is_critical_match
+                },
+                "field_wise": field_wise
             })
             
     # Aggregate summary
@@ -119,10 +123,31 @@ def run_benchmarks(resources_dir: str = "resources") -> Dict[str, Any]:
         exact_matches_all = sum(e["metrics"]["exact_matches"] for e in evals)
         total_cer_all = sum(e["metrics"]["total_cer"] for e in evals)
         total_time_all = sum(e["metrics"]["processing_time_ms"] for e in evals)
+        critical_matches_all = sum(1 for e in evals if e["metrics"].get("is_critical_match"))
         
         acc = (exact_matches_all / total_fields_all) * 100 if total_fields_all > 0 else 0
         avg_cer = (total_cer_all / total_fields_all) * 100 if total_fields_all > 0 else 0
         avg_time = total_time_all / len(evals) if evals else 0
+        critical_acc = (critical_matches_all / len(evals)) * 100 if evals else 0
+        
+        # Aggregate field-wise accuracy
+        field_stats: Dict[str, Dict[str, int]] = {}  # field -> {"matches": n, "total": n, "cer_sum": float}
+        for e in evals:
+            for field_name, fdata in e.get("field_wise", {}).items():
+                if field_name not in field_stats:
+                    field_stats[field_name] = {"matches": 0, "total": 0, "cer_sum": 0.0}
+                field_stats[field_name]["total"] += 1
+                field_stats[field_name]["matches"] += fdata["exact_match"]
+                field_stats[field_name]["cer_sum"] += fdata["cer"]
+        
+        field_accuracy = {}
+        for fname, fstats in field_stats.items():
+            field_accuracy[fname] = {
+                "accuracy_percent": (fstats["matches"] / fstats["total"] * 100) if fstats["total"] > 0 else 0,
+                "avg_cer_percent": (fstats["cer_sum"] / fstats["total"] * 100) if fstats["total"] > 0 else 0,
+                "exact_matches": fstats["matches"],
+                "total": fstats["total"],
+            }
         
         results["summary"][method_name] = {
             "exact_matches": exact_matches_all,
@@ -130,7 +155,10 @@ def run_benchmarks(resources_dir: str = "resources") -> Dict[str, Any]:
             "accuracy_percent": acc,
             "cer_percent": avg_cer,
             "avg_time_ms": avg_time,
-            "images_processed": len(evals)
+            "images_processed": len(evals),
+            "field_accuracy": field_accuracy,
+            "critical_matches": critical_matches_all,
+            "critical_accuracy_percent": critical_acc
         }
         
     return results

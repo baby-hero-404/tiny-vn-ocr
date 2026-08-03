@@ -39,3 +39,36 @@ def evaluate_predictions(truth_fields: Dict[str, str], pred_fields: Dict[str, st
         total_cer += cer
         
     return total_fields, exact_matches, total_cer
+
+
+def evaluate_field_wise(truth_fields: Dict[str, str], pred_fields: Dict[str, str], fields_to_check: list[str]) -> Dict[str, Dict[str, float]]:
+    """Per-field evaluation: for each field return exact_match (0/1) and CER.
+    
+    Returns:
+        Dict mapping field_name -> {"exact_match": 0|1, "cer": float, "present": bool}
+        Only includes fields that have a non-empty ground truth value.
+    """
+    result = {}
+    for field in fields_to_check:
+        t_val = str(truth_fields.get(field, "")).strip()
+        if not t_val:
+            continue
+        p_val = str(pred_fields.get(field, "")).strip()
+        cer = calculate_cer(t_val, p_val)
+        result[field] = {
+            "exact_match": 1 if t_val == p_val else 0,
+            "cer": cer,
+            "present": bool(p_val),
+        }
+    return result
+
+def evaluate_critical_fields(truth_fields: Dict[str, str], pred_fields: Dict[str, str], critical_fields: list[str]) -> bool:
+    """Check if all critical fields match exactly (Option B strict match)."""
+    for field in critical_fields:
+        t_val = str(truth_fields.get(field, "")).strip()
+        if not t_val:
+            continue
+        p_val = str(pred_fields.get(field, "")).strip()
+        if t_val != p_val:
+            return False
+    return True
