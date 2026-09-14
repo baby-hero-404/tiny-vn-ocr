@@ -181,7 +181,9 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
 
                     best_cand = cand
                     for c_img in [crop_orig, crop_sharp, crop_thresh]:
-                        res, _ = ocr_engine.recognize_tesseract(c_img, field_type="id_number")
+                        res, _ = ocr_engine.recognize_rapidocr(c_img)
+                        if not res:
+                            res, _ = ocr_engine.recognize_tesseract(c_img, field_type="id_number")
                         if not res:
                             res = ocr_engine.recognize_crop_vietocr(c_img)
                         res_clean = re.sub(r"\D", "", res)
@@ -461,17 +463,20 @@ def parse_cccd_back(elements: List[Dict]) -> Dict[str, str]:
     for idx, key, el in tagged:
         if key == "issuer":
             raw_text = el["text"]
-            # Clean title prefixes
-            raw_text = re.sub(r'(?i)(CỤC TRƯỞNG|GIÁM ĐỐC|CỤC TRƯỜNG)', '', raw_text).strip()
-            # Remove English suffix
-            raw_text = re.sub(r'(?i)/?\s*MINISTRY.*$', '', raw_text).strip()
-            # Fuzzy match against known issuers
-            from rapidfuzz import process as rfprocess
-            match = rfprocess.extractOne(raw_text, KNOWN_ISSUERS, scorer=fuzz.WRatio, score_cutoff=55.0)
-            if match:
-                fields["place_of_issue"] = match[0]
+            norm = _strip_accents(raw_text).upper()
+            if "BO CONG AN" in norm:
+                fields["place_of_issue"] = "BỘ CÔNG AN"
+            elif "CANH SAT" in norm or "CUC CANH" in norm:
+                fields["place_of_issue"] = "CỤC CẢNH SÁT QUẢN LÝ HÀNH CHÍNH VỀ TRẬT TỰ XÃ HỘI"
             else:
-                fields["place_of_issue"] = raw_text
+                cleaned = re.sub(r'(?i)(CỤC\s*TRƯỞNG|CUC\s*TRUONG|GIÁM\s*ĐỐC|GIAM\s*DOC|CỤC\s*TRƯỜNG)', '', raw_text).strip()
+                cleaned = re.sub(r'(?i)/?\s*MINISTRY.*$', '', cleaned).strip()
+                from rapidfuzz import process as rfprocess
+                match = rfprocess.extractOne(cleaned, KNOWN_ISSUERS, scorer=fuzz.partial_ratio, score_cutoff=60.0)
+                if match:
+                    fields["place_of_issue"] = match[0]
+                else:
+                    fields["place_of_issue"] = raw_text
             break
 
     return fields

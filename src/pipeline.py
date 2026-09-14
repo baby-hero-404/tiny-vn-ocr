@@ -1,6 +1,6 @@
 """Document OCR pipeline orchestrator for Tiny VN OCR."""
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import time
 import logging
 import numpy as np

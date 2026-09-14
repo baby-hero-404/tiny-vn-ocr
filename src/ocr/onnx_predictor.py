@@ -87,7 +87,7 @@ class ONNXPredictor:
             batch_size = src.shape[1]
             trg_indexes = [[self.vocab.go] for _ in range(batch_size)]
             
-            max_seq_len = 128
+            max_seq_len = 64
             
             for i in range(max_seq_len):
                 trg_tensor = torch.LongTensor([seq[-1] for seq in trg_indexes])
@@ -95,8 +95,14 @@ class ONNXPredictor:
                 output, hidden, _ = self.transformer.decoder(trg_tensor, hidden, outputs)
                 top1 = output.argmax(1).tolist()
                 
+                all_ended = True
                 for j in range(batch_size):
                     trg_indexes[j].append(top1[j])
+                    if top1[j] != self.vocab.eos:
+                        all_ended = False
+                        
+                if all_ended:
+                    break
                     
             # Check for EOS and decode
             final_str = []
