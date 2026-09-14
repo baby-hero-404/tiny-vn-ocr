@@ -35,49 +35,55 @@ VN_SURNAMES = [
     "Triệu", "Trịnh", "Trương", "Ung", "Ưng", "Văn", "Vĩnh", "Vò",
 ]
 
-# Build lookup: base_form -> correct_form
-_SURNAME_BASE_MAP: dict[str, str] = {}
-for name in VN_SURNAMES:
+# Common Vietnamese given/middle names that OCR often misinterprets
+VN_GIVEN_NAMES = [
+    "Như", "Nhữ", "Thúy", "Thủy", "Tâm", "Tầm", "Tuấn", "Tuấn",
+    "Danh", "Nguyễn", "Thị", "Văn", "An", "Anh", "Bình", "Chính", "Cường", "Dũng",
+    "Đạt", "Đức", "Hải", "Hào", "Hiếu", "Hùng", "Huy", "Khang", "Khánh", "Khoa", "Khôi",
+    "Kiên", "Lâm", "Long", "Minh", "Nam", "Nghĩa", "Ngọc", "Nhật", "Phát", "Phong",
+    "Phúc", "Quân", "Quang", "Quốc", "Sơn", "Tài", "Thắng", "Thành", "Thiên", "Thịnh",
+    "Trung", "Trường", "Tú", "Tuấn", "Uy", "Việt", "Vinh", "Vũ", "Xuân",
+    "Bảo", "Bích", "Châu", "Chi", "Diệp", "Diệu", "Dung", "Đào", "Giang",
+    "Giao", "Hà", "Hân", "Hằng", "Hoa", "Hoà", "Hoài", "Hương", "Hường",
+    "Kim", "Lan", "Lê", "Liên", "Linh", "Loan", "Ly", "Mai", "My",
+    "Nga", "Ngân", "Nghi", "Nhung", "Oanh", "Phạm", "Phương", "Phượng",
+    "Quyên", "Quỳnh", "Thảo", "Thi", "Thu", "Thương", "Thư", "Tiên", "Trang",
+    "Trâm", "Trân", "Trúc", "Tâm", "Uyên", "Vân", "Vy", "Yến", "Xuân",
+    "Nhi", "Hạnh", "Hiền", "Tuyết", "Mai", "Thi", "Thắm", "Trinh"
+]
+
+# Build lookup for all valid name syllables (Surnames + Given names)
+_NAME_BASE_MAP: dict[str, str] = {}
+for name in VN_SURNAMES + VN_GIVEN_NAMES:
     base = _strip_accents(name).lower()
-    # First entry wins (most common variant)
-    if base not in _SURNAME_BASE_MAP:
-        _SURNAME_BASE_MAP[base] = name
+    # If conflict, first entry wins
+    if base not in _NAME_BASE_MAP:
+        _NAME_BASE_MAP[base] = name
 
-
-def correct_surname(raw_name: str) -> str:
-    """Correct OCR diacritics errors in the SURNAME (first word) only.
+def correct_full_name(raw_name: str) -> str:
+    """Correct OCR diacritics errors in Vietnamese full names.
     
-    This is generalizable because Vietnamese surnames are a finite, 
-    well-defined set. We match by base characters (ignoring tone marks)
-    and replace with the canonical diacritics.
-    
-    Given names and middle names are NOT corrected because they are
-    too diverse — that requires OCR model improvement or NLP spell-checking.
+    Matches each word by base characters (ignoring tone marks)
+    and replaces with canonical diacritics if found in dictionary.
     
     Examples:
-        "BŨI VĂN TIẾN" → "BÙI VĂN TIẾN"  (BŨI not a valid surname)
-        "HUỲNH VĨNH PHƯỚC" → unchanged     (HUỲNH is already correct)
+        "DANH NGUYỄN TÂM NHƯ" → "DANH NGUYỄN TÂM NHỮ" (if NHỮ is in dict)
     """
     if not raw_name:
         return raw_name
     
     words = raw_name.split()
-    if not words:
-        return raw_name
+    corrected_words = []
     
-    first_word = words[0]
-    is_upper = first_word == first_word.upper()
-    
-    # Look up by base characters
-    base = _strip_accents(first_word).lower()
-    canonical = _SURNAME_BASE_MAP.get(base)
-    
-    if canonical and canonical.lower() != first_word.lower():
-        # The surname exists but with different diacritics → correct it
-        if is_upper:
-            words[0] = canonical.upper()
+    for word in words:
+        is_upper = word == word.upper()
+        base = _strip_accents(word).lower()
+        canonical = _NAME_BASE_MAP.get(base)
+        
+        if canonical and canonical.lower() != word.lower():
+            # Apply correction
+            corrected_words.append(canonical.upper() if is_upper else canonical)
         else:
-            words[0] = canonical
-        return " ".join(words)
-    
-    return raw_name
+            corrected_words.append(word)
+            
+    return " ".join(corrected_words)

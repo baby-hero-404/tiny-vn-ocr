@@ -6,6 +6,20 @@ from typing import Dict, List, Any, Optional, Tuple
 
 from rapidfuzz import fuzz
 
+date_pattern = re.compile(r'\d{2}[/.\-]\d{2}[/.\-]\d{4}')
+
+
+def extract_mangled_date(text: str) -> str:
+    match = re.search(r'\d{2}[/.\-]\d{2}[/.\-]\d{4}', text)
+    if match:
+        return match.group(0).replace(".", "/").replace("-", "/")
+    match = re.search(r'\b\d{4,5}[/.\-]\d{4}\b|\b\d{2}[/.\-]\d{6,7}\b', text)
+    if match:
+        d_clean = re.sub(r'[^\d]', '', match.group(0))
+        if len(d_clean) >= 8:
+            return f"{d_clean[:2]}/{d_clean[2:4]}/{d_clean[-4:]}"
+    return ""
+
 
 def _strip_accents(s: str) -> str:
     nfkd = unicodedata.normalize('NFD', s)
@@ -16,61 +30,8 @@ def _strip_accents(s: str) -> str:
 # Step 1: Merge boxes on the same horizontal line
 # ============================================================
 
-def merge_horizontal(elements: List[Dict]) -> List[Dict]:
-    """Merge text boxes that sit on the same horizontal line."""
-    if not elements:
-        return []
-
-    sorted_els = sorted(elements, key=lambda e: (e["center"][1], e["center"][0]))
-    lines: List[List[Dict]] = []
-    cur: List[Dict] = []
-
-    for el in sorted_els:
-        if not cur:
-            cur.append(el)
-            continue
-
-        last = cur[-1]
-        # Y overlap ratio
-        y_overlap = max(0, min(el["bbox"][3], last["bbox"][3]) - max(el["bbox"][1], last["bbox"][1]))
-        min_h = min(el["bbox"][3] - el["bbox"][1], last["bbox"][3] - last["bbox"][1])
-        y_center_diff = abs(el["center"][1] - last["center"][1])
-        
-        same_line = False
-        if min_h > 0 and (y_overlap / min_h) > 0.5 and y_center_diff < min_h * 0.4:
-            # Calculate true X distance between two intervals [x1, x2] and [x3, x4]
-            # If they overlap in X, distance is 0. Otherwise it's the gap between them.
-            x1, x2 = last["bbox"][0], last["bbox"][2]
-            x3, x4 = el["bbox"][0], el["bbox"][2]
-            x_dist = max(0, max(x1, x3) - min(x2, x4))
-            
-            # Tighten the threshold: words on the same line shouldn't have a huge gap
-            if x_dist < min_h * 0.5:
-                same_line = True
-
-        if same_line:
-            cur.append(el)
-        else:
-            lines.append(cur)
-            cur = [el]
-
-    if cur:
-        lines.append(cur)
-
-    merged = []
-    for line in lines:
-        text = " ".join(e["text"] for e in line)
-        xmin = min(e["bbox"][0] for e in line)
-        ymin = min(e["bbox"][1] for e in line)
-        xmax = max(e["bbox"][2] for e in line)
-        ymax = max(e["bbox"][3] for e in line)
-        merged.append({
-            "text": text,
-            "bbox": [xmin, ymin, xmax, ymax],
-            "center": [(xmin + xmax) / 2, (ymin + ymax) / 2],
-            "height": ymax - ymin,
-        })
-    return merged
+# Removed merge_horizontal because RapidOCR naturally detects lines,
+# and merging them can mistakenly merge separate columns (e.g. Expiry Date and Residence)
 
 
 # ============================================================
@@ -140,13 +101,19 @@ def _extract_inline_value(text: str) -> str:
 # Step 3: CCCD Front-side layout parser
 # ============================================================
 
-def parse_cccd_front(elements: List[Dict]) -> Dict[str, str]:
+def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[str, str]:
     """Parse CCCD front side using bbox layout."""
     fields: Dict[str, str] = {}
     if not elements:
         return fields
 
-    lines = merge_horizontal(elements)
+    # 1. Sort elements top-to-bottom, then left-to-right
+    lines = sorted(elements, key=lambda e: (e["center"][1], e["bbox"][0]))
+    
+    # Calculate height for each line if missing
+    for el in lines:
+        if "height" not in el:
+            el["height"] = el["bbox"][3] - el["bbox"][1]
     full_text = " ".join(el["text"] for el in lines)
 
     # Determine the main content X range (right column of CCCD)
@@ -162,11 +129,69 @@ def parse_cccd_front(elements: List[Dict]) -> Dict[str, str]:
         key = _classify_line(el["text"], FRONT_LABELS)
         tagged.append((i, key, el))
 
-    # --- ID Number: regex on full text ---
+    # --- ID Number: regex on full text & Retry Logic ---
     id_text = full_text.replace(" ", "")
     id_match = re.search(r'\d{12}', id_text)
-    if id_match:
-        fields["id_number"] = id_match.group(0)
+    
+    # Import the semantic validator
+    import sys, os
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/../..")
+    from src.postprocessing.validator import FieldValidator
+    
+    cand = id_match.group(0) if id_match else None
+    
+    if cand and FieldValidator.is_valid_cccd_id(cand):
+        fields["id_number"] = cand
+    else:
+        if cand:
+            fields["id_number"] = cand # fallback
+            
+        # Step 1: ID Retry & Multi-pass OCR (if invalid pattern or not found)
+        if image is not None and ocr_engine is not None:
+            # Find the bounding box of the line tagged as "id_number"
+            id_el = next((el for _, key, el in tagged if key == "id_number"), None)
+            if id_el:
+                import cv2
+                import numpy as np
+                
+                if "crop" in id_el:
+                    crop = id_el["crop"]
+                else:
+                    xmin, ymin, xmax, ymax = id_el["bbox"]
+                    pad_x = 3
+                    pad_y_top = 6
+                    pad_y_bottom = 4
+                    c_xmin = max(0, int(xmin) - pad_x)
+                    c_ymin = max(0, int(ymin) - pad_y_top)
+                    c_xmax = min(image.shape[1], int(xmax) + pad_x)
+                    c_ymax = min(image.shape[0], int(ymax) + pad_y_bottom)
+                    crop = image[c_ymin:c_ymax, c_xmin:c_xmax]
+
+                if crop is None or crop.size == 0:
+                    pass
+                else:
+                    # Bước 2: Multi preprocessing
+                    crop_orig = crop.copy()
+                    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                    blurred = cv2.GaussianBlur(gray, (0, 0), 3)
+                    sharpened_gray = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
+                    crop_sharp = cv2.cvtColor(sharpened_gray, cv2.COLOR_GRAY2BGR)
+                    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                    crop_thresh = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+
+                    best_cand = cand
+                    for c_img in [crop_orig, crop_sharp, crop_thresh]:
+                        res, _ = ocr_engine.recognize_tesseract(c_img, field_type="id_number")
+                        if not res:
+                            res = ocr_engine.recognize_crop_vietocr(c_img)
+                        res_clean = re.sub(r"\D", "", res)
+                        m = re.search(r"\d{12}", res_clean)
+                        if m:
+                            val = m.group(0)
+                            if FieldValidator.is_valid_cccd_id(val):
+                                best_cand = val
+                                break
+                    fields["id_number"] = best_cand
 
     # --- Full Name ---
     for idx, key, el in tagged:
@@ -186,18 +211,17 @@ def parse_cccd_front(elements: List[Dict]) -> Dict[str, str]:
             break
 
     # --- Date of Birth ---
-    date_pattern = re.compile(r'\d{2}[/.\-]\d{2}[/.\-]\d{4}')
     for idx, key, el in tagged:
         if key == "dob":
-            match = date_pattern.search(el["text"])
-            if match:
-                fields["date_of_birth"] = match.group(0).replace(".", "/").replace("-", "/")
+            val = extract_mangled_date(el["text"])
+            if val:
+                fields["date_of_birth"] = val
             else:
                 # Check next line
                 if idx + 1 < len(tagged):
-                    match = date_pattern.search(tagged[idx + 1][2]["text"])
-                    if match:
-                        fields["date_of_birth"] = match.group(0).replace(".", "/").replace("-", "/")
+                    val = extract_mangled_date(tagged[idx + 1][2]["text"])
+                    if val:
+                        fields["date_of_birth"] = val
             break
 
     # --- Gender & Nationality ---
@@ -279,8 +303,14 @@ def parse_cccd_front(elements: List[Dict]) -> Dict[str, str]:
             if j_key is not None:
                 continue
 
-            # X-column check: value must be roughly aligned with label
-            if abs(j_el["bbox"][0] - start_x) > x_tolerance:
+            # X-column check: value must be roughly in the same column or to the right
+            # We don't want to include the left column (Expiry Date) when parsing Residence.
+            # But we don't strictly bound the right side because addresses can be long.
+            if j_el["bbox"][0] < start_x - x_tolerance:
+                continue
+
+            # Skip if it is a label in the left column that happened to bypass stop_y
+            if j_key is not None and j_el["bbox"][0] < start_x - x_tolerance:
                 continue
 
             text = j_el["text"].strip()
@@ -304,15 +334,15 @@ def parse_cccd_front(elements: List[Dict]) -> Dict[str, str]:
     # --- Date of Expiry: collect from expiry label or left-column ---
     for idx, key, el in tagged:
         if key == "expiry":
-            match = date_pattern.search(el["text"])
-            if match:
-                fields["date_of_expiry"] = match.group(0).replace(".", "/").replace("-", "/")
+            val = extract_mangled_date(el["text"])
+            if val:
+                fields["date_of_expiry"] = val
             else:
                 # Check next line
                 if idx + 1 < len(tagged):
-                    match = date_pattern.search(tagged[idx + 1][2]["text"])
-                    if match:
-                        fields["date_of_expiry"] = match.group(0).replace(".", "/").replace("-", "/")
+                    val = extract_mangled_date(tagged[idx + 1][2]["text"])
+                    if val:
+                        fields["date_of_expiry"] = val
             break
 
     # Expiry fallback: find all dates, take the last one that isn't DOB
@@ -338,7 +368,13 @@ def parse_cccd_back(elements: List[Dict]) -> Dict[str, str]:
     if not elements:
         return fields
 
-    lines = merge_horizontal(elements)
+    # 1. Sort elements top-to-bottom, then left-to-right
+    lines = sorted(elements, key=lambda e: (e["center"][1], e["bbox"][0]))
+    
+    # Calculate height for each line if missing
+    for el in lines:
+        if "height" not in el:
+            el["height"] = el["bbox"][3] - el["bbox"][1]
     full_text = " ".join(el["text"] for el in lines)
     date_pattern = re.compile(r'\d{2}[/.\-]\d{2}[/.\-]\d{4}')
 
@@ -565,10 +601,10 @@ def _strip_all_labels(text: str) -> str:
 # Main entry point
 # ============================================================
 
-def layout_parse(elements: List[Dict], doc_type: str) -> Dict[str, str]:
+def layout_parse(elements: List[Dict], doc_type: str, image=None, ocr_engine=None) -> Dict[str, str]:
     """Parse document using layout-aware bbox extraction."""
     if doc_type in ("cccd", "cccd_front"):
-        return parse_cccd_front(elements)
+        return parse_cccd_front(elements, image=image, ocr_engine=ocr_engine)
     elif doc_type == "cccd_back":
         return parse_cccd_back(elements)
     elif doc_type == "cccd_auto":
@@ -582,5 +618,5 @@ def layout_parse(elements: List[Dict], doc_type: str) -> Dict[str, str]:
         if back_score > front_score:
             return parse_cccd_back(elements)
         else:
-            return parse_cccd_front(elements)
+            return parse_cccd_front(elements, image=image, ocr_engine=ocr_engine)
     return {}

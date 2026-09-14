@@ -130,15 +130,28 @@ def run_benchmarks(resources_dir: str = "resources") -> Dict[str, Any]:
         avg_time = total_time_all / len(evals) if evals else 0
         critical_acc = (critical_matches_all / len(evals)) * 100 if evals else 0
         
-        # Aggregate field-wise accuracy
+        # Aggregate field-wise accuracy, including by doc_type
         field_stats: Dict[str, Dict[str, int]] = {}  # field -> {"matches": n, "total": n, "cer_sum": float}
+        doctype_field_stats: Dict[str, Dict[str, Dict[str, int]]] = {} # doc_type -> field -> stats
+        
         for e in evals:
+            dtype = e.get("doc_type", "unknown")
+            if dtype not in doctype_field_stats:
+                doctype_field_stats[dtype] = {}
+                
             for field_name, fdata in e.get("field_wise", {}).items():
+                # Global stats
                 if field_name not in field_stats:
                     field_stats[field_name] = {"matches": 0, "total": 0, "cer_sum": 0.0}
                 field_stats[field_name]["total"] += 1
                 field_stats[field_name]["matches"] += fdata["exact_match"]
                 field_stats[field_name]["cer_sum"] += fdata["cer"]
+                
+                # By doc_type stats
+                if field_name not in doctype_field_stats[dtype]:
+                    doctype_field_stats[dtype][field_name] = {"matches": 0, "total": 0}
+                doctype_field_stats[dtype][field_name]["total"] += 1
+                doctype_field_stats[dtype][field_name]["matches"] += fdata["exact_match"]
         
         field_accuracy = {}
         for fname, fstats in field_stats.items():
@@ -149,6 +162,16 @@ def run_benchmarks(resources_dir: str = "resources") -> Dict[str, Any]:
                 "total": fstats["total"],
             }
         
+        doctype_accuracy = {}
+        for dtype, d_stats in doctype_field_stats.items():
+            doctype_accuracy[dtype] = {}
+            for fname, fstats in d_stats.items():
+                doctype_accuracy[dtype][fname] = {
+                    "accuracy_percent": (fstats["matches"] / fstats["total"] * 100) if fstats["total"] > 0 else 0,
+                    "exact_matches": fstats["matches"],
+                    "total": fstats["total"],
+                }
+                
         results["summary"][method_name] = {
             "exact_matches": exact_matches_all,
             "total_fields": total_fields_all,
@@ -157,6 +180,7 @@ def run_benchmarks(resources_dir: str = "resources") -> Dict[str, Any]:
             "avg_time_ms": avg_time,
             "images_processed": len(evals),
             "field_accuracy": field_accuracy,
+            "doctype_accuracy": doctype_accuracy,
             "critical_matches": critical_matches_all,
             "critical_accuracy_percent": critical_acc
         }

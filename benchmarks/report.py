@@ -99,7 +99,42 @@ def _write_markdown_report(results: Dict[str, Any], filepath: Path):
                         f.write(" — |")
                 f.write("\n")
             
-        f.write("\n## Detailed Results\n\n")
+        f.write("\n## Field-wise Accuracy by Document Type\n\n")
+        
+        # Determine all document types present
+        all_dtypes = set()
+        for _, stats in sorted_methods:
+            all_dtypes.update(stats.get("doctype_accuracy", {}).keys())
+            
+        for dtype in sorted(all_dtypes):
+            f.write(f"### Document Type: `{dtype}`\n\n")
+            f.write("| Method |")
+            for field in ordered_fields:
+                short_name = field.replace("place_of_", "").replace("date_of_", "")
+                f.write(f" {short_name} |")
+            f.write("\n")
+            
+            f.write("|---|")
+            for _ in ordered_fields:
+                f.write("---|")
+            f.write("\n")
+            
+            for method_name, stats in sorted_methods:
+                dtype_acc = stats.get("doctype_accuracy", {}).get(dtype, {})
+                f.write(f"| `{method_name}` |")
+                for field in ordered_fields:
+                    fa = dtype_acc.get(field, {})
+                    if fa:
+                        acc_pct = fa["accuracy_percent"]
+                        matches = fa["exact_matches"]
+                        total = fa["total"]
+                        f.write(f" {acc_pct:.0f}% ({matches}/{total}) |")
+                    else:
+                        f.write(" N/A |")
+                f.write("\n")
+            f.write("\n")
+            
+        f.write("## Detailed Results\n\n")
         for method_name, _ in sorted_methods:
             f.write(f"### {method_name}\n\n")
             evals = results.get("evaluations", {}).get(method_name, [])

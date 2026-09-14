@@ -65,6 +65,8 @@ venv.bak/
 # MacOS
 .DS_Store
 
-resources/
+resources/cccd/
+resources/gplx/
+resources/gtx/
 
 benchmarks/results/*.json

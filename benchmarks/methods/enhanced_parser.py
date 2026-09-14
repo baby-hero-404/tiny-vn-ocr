@@ -9,7 +9,7 @@ from rapidfuzz import process, fuzz
 
 from benchmarks.registry import register_method
 from benchmarks.methods.cccd_rules import validate_and_fix_expiry
-from benchmarks.methods.vn_name_dict import correct_surname
+from benchmarks.methods.vn_name_dict import correct_full_name
 from src.ocr.engine import OCREngine
 from src.postprocessing.parser import _strip_accents, detect_cccd_side, KNOWN_ISSUERS
 
@@ -366,7 +366,7 @@ def enhanced_parse(lines: List[str], document_type: str) -> Dict[str, str]:
 
         # Post-processing: surname correction
         if "full_name" in fields:
-            fields["full_name"] = correct_surname(fields["full_name"])
+            fields["full_name"] = correct_full_name(fields["full_name"])
 
         # Post-processing: CCCD expiry date cross-validation
         fields = validate_and_fix_expiry(fields)

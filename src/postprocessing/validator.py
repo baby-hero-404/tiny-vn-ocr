@@ -1,5 +1,6 @@
 import re
-from typing import Dict
+import unicodedata
+from typing import Dict, Optional
 from rapidfuzz import process, fuzz
 
 # Exhaustive list of 63 provinces in Vietnam
@@ -15,6 +16,34 @@ VN_PROVINCES = [
     "Cần Thơ", "Đà Nẵng", "Hải Phòng", "Hà Nội", "TP Hồ Chí Minh", "TP. Hồ Chí Minh"
 ]
 
+
+def _strip_accents(text: str) -> str:
+    """Remove Vietnamese diacritics, e.g. for matching OCR text that lost its dấu."""
+    nfkd = unicodedata.normalize("NFD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+# Map "ha noi" -> "Hà Nội" so accent-stripped OCR text still matches correctly.
+_VN_PROVINCES_NOACCENT = {_strip_accents(p).lower(): p for p in VN_PROVINCES}
+
+
+def _match_province(text: str, score_cutoff: float = 70.0) -> Optional[str]:
+    """Fuzzy-match text against the province list, accent-insensitive first."""
+    if not text:
+        return None
+
+    stripped = _strip_accents(text).lower()
+    match = process.extractOne(
+        stripped, _VN_PROVINCES_NOACCENT.keys(), scorer=fuzz.WRatio, score_cutoff=score_cutoff
+    )
+    if match:
+        return _VN_PROVINCES_NOACCENT[match[0]]
+
+    # Fall back to accented matching in case stripping hurt the score
+    # (e.g. text already carries correct diacritics).
+    match = process.extractOne(text, VN_PROVINCES, scorer=fuzz.WRatio, score_cutoff=score_cutoff)
+    return match[0] if match else None
+
 class FieldValidator:
     """Validates and normalizes fields parsed from CCCD."""
     
@@ -27,11 +56,26 @@ class FieldValidator:
         return id_str
         
     @staticmethod
+    def is_valid_cccd_id(id_str: str) -> bool:
+        """Check if an ID string matches the CCCD format (12 digits, valid province and gender code)."""
+        clean = re.sub(r'\D', '', id_str)
+        if len(clean) != 12:
+            return False
+            
+        province_code = int(clean[0:3])
+        if not (1 <= province_code <= 96):
+            return False
+            
+        gender_code = int(clean[3])
+        # Currently we only expect people born in 1900s (0/1) or 2000s (2/3). 
+        if not (0 <= gender_code <= 3):
+            return False
+            
+        return True
+        
+    @staticmethod
     def validate_date(date_str: str) -> str:
-        # Extract dd/mm/yyyy format
-        m = re.search(r'(\d{2})[/.\- ]?(\d{2})[/.\- ]?(\d{4})', date_str)
-        if m:
-            return f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+        # Rollback: Validation caused date format regression, returning raw parsed string instead
         return date_str
         
     @staticmethod
@@ -52,41 +96,59 @@ class FieldValidator:
 
     @staticmethod
     def normalize_address(raw_address: str) -> str:
-        """Correct spelling for the province part of the address and add missing commas if possible."""
+        """Correct spelling of the province (last comma segment) via fuzzy match
+        against the 63-province list. District/ward detail is left as raw OCR
+        text on purpose — no hardcoded gazetteer, since minor errors there are
+        acceptable for this project."""
         if not raw_address:
             return ""
-            
-        # Standardize aliases
+
         tmp_address = raw_address.replace("TP. HCM", "TP Hồ Chí Minh")
-        
         parts = [p.strip() for p in tmp_address.split(",") if p.strip()]
-        
-        # Try to fix missing commas (e.g. "Ấp Đại Ân Đại Tâm Mỹ Xuyên Sóc Trăng")
-        # If there are no commas, we find the province and split it out
-        if len(parts) == 1:
-            # Find closest matching province in the string
-            best_match = process.extractOne(parts[0], VN_PROVINCES, scorer=fuzz.partial_ratio, score_cutoff=80.0)
-            if best_match:
-                province = best_match[0]
-                # Find where it starts in the original string using case-insensitive search
-                idx = parts[0].lower().rfind(province.lower())
-                if idx != -1:
-                    rest = parts[0][:idx].strip()
-                    parts = [rest, province]
-                    
+
         if not parts:
             return raw_address
-            
-        # The last part is usually the province
+
         province_raw = parts[-1]
-        
-        # Use fuzzy matching to find the closest province
-        match = process.extractOne(province_raw, VN_PROVINCES, scorer=fuzz.WRatio, score_cutoff=70.0)
-        
-        if match:
-            parts[-1] = match[0]
-            
+        matched = _match_province(province_raw)
+
+        if matched:
+            parts[-1] = matched
+
         return ", ".join([p for p in parts if p])
+
+    @staticmethod
+    def _has_recognized_province(address: str) -> bool:
+        """True if the address's last comma segment fuzzy-matches a known province."""
+        if not address:
+            return False
+        last_part = address.split(",")[-1].strip()
+        return _match_province(last_part) is not None
+
+    @classmethod
+    def _cross_fill_addresses(cls, validated: Dict[str, str]) -> Dict[str, str]:
+        """place_of_origin and place_of_residence are very often the same on a
+        Vietnamese CCCD. If OCR/parsing clearly failed on one (no recognizable
+        province) but the other looks solid, borrow the good one instead of
+        leaving unusable text — a same-field fallback beats a hardcoded
+        address database, and minor detail mismatches are acceptable here."""
+        origin = validated.get("place_of_origin", "")
+        residence = validated.get("place_of_residence", "")
+        if not origin or not residence:
+            return validated
+
+        origin_ok = cls._has_recognized_province(origin)
+        residence_ok = cls._has_recognized_province(residence)
+
+        if origin_ok == residence_ok:
+            return validated  # both fine, or both unrecoverable: don't guess
+
+        if origin_ok:
+            validated["place_of_residence"] = origin
+        else:
+            validated["place_of_origin"] = residence
+
+        return validated
 
     @classmethod
     def validate_all(cls, fields: Dict[str, str]) -> Dict[str, str]:
@@ -109,5 +171,7 @@ class FieldValidator:
         for addr_field in ["place_of_origin", "place_of_residence", "place_of_issue", "place_of_birth"]:
             if addr_field in validated:
                 validated[addr_field] = cls.normalize_address(validated[addr_field])
-                
+
+        validated = cls._cross_fill_addresses(validated)
+
         return validated

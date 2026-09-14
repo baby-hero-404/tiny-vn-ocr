@@ -136,22 +136,12 @@ class OCREngine:
             if not result:
                 return []
 
-            # Lazy load VietOCR as a singleton to save memory across instances
+            # Lazy load VietOCR ONNX as a singleton
             global _SHARED_VIETOCR_PREDICTOR
             if _SHARED_VIETOCR_PREDICTOR is None:
-                import PIL
-                if not hasattr(PIL.Image, 'ANTIALIAS'):
-                    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
-                    
-                from vietocr.tool.predictor import Predictor
-                from vietocr.tool.config import Cfg
-                
-                config = Cfg.load_config_from_name('vgg_seq2seq')
-                config['cnn']['pretrained'] = False
-                config['device'] = 'cpu'
-                config['predictor']['beamsearch'] = False
-                _SHARED_VIETOCR_PREDICTOR = Predictor(config)
-            
+                from src.ocr.onnx_predictor import ONNXPredictor
+                _SHARED_VIETOCR_PREDICTOR = ONNXPredictor('vgg_seq2seq')
+
             self.vietocr_predictor = _SHARED_VIETOCR_PREDICTOR
 
             from PIL import Image
@@ -208,22 +198,12 @@ class OCREngine:
             if not result:
                 return []
 
-            # Lazy load VietOCR as a singleton
+            # Lazy load VietOCR ONNX as a singleton
             global _SHARED_VIETOCR_PREDICTOR
             if _SHARED_VIETOCR_PREDICTOR is None:
-                import PIL
-                if not hasattr(PIL.Image, 'ANTIALIAS'):
-                    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
-                    
-                from vietocr.tool.predictor import Predictor
-                from vietocr.tool.config import Cfg
-                
-                config = Cfg.load_config_from_name('vgg_seq2seq')
-                config['cnn']['pretrained'] = False
-                config['device'] = 'cpu'
-                config['predictor']['beamsearch'] = False
-                _SHARED_VIETOCR_PREDICTOR = Predictor(config)
-                
+                from src.ocr.onnx_predictor import ONNXPredictor
+                _SHARED_VIETOCR_PREDICTOR = ONNXPredictor('vgg_seq2seq')
+
             self.vietocr_predictor = _SHARED_VIETOCR_PREDICTOR
 
             from PIL import Image
@@ -265,13 +245,92 @@ class OCREngine:
                                     (tight_xmin + tight_xmax) / 2,
                                     (tight_ymin + tight_ymax) / 2
                                 ],
-                                "height": tight_ymax - tight_ymin
+                                "height": tight_ymax - tight_ymin,
+                                "crop": crop
                             })
 
             return elements
         except Exception as e:
             logger.error(f"VietOCR 2-stage recognition with bboxes failed: {e}")
             return []
+
+    def recognize_lines_rapidocr_with_bboxes(self, image: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        Runs ONLY RapidOCR to detect boxes and read text. Fast and memory efficient.
+        Returns a list of dicts: {"text": str, "bbox": [xmin, ymin, xmax, ymax], "center": [cx, cy], "crop": crop}
+        """
+        if not HAS_RAPIDOCR or not self.rapidocr_engine:
+            return []
+            
+        try:
+            result, _ = self.rapidocr_engine(image)
+            if not result:
+                return []
+                
+            elements = []
+            for item in result:
+                if len(item) >= 3:
+                    box = item[0]
+                    text = item[1]
+                    score = float(item[2])
+                    
+                    x_coords = [p[0] for p in box]
+                    y_coords = [p[1] for p in box]
+                    
+                    tight_xmin = min(x_coords)
+                    tight_xmax = max(x_coords)
+                    tight_ymin = min(y_coords)
+                    tight_ymax = max(y_coords)
+                    
+                    # Store padded crop
+                    padding_y_top = 6
+                    padding_y_bottom = 4
+                    padding_x = 3
+
+                    xmin = max(0, int(tight_xmin) - padding_x)
+                    xmax = min(image.shape[1], int(tight_xmax) + padding_x)
+                    ymin = max(0, int(tight_ymin) - padding_y_top)
+                    ymax = min(image.shape[0], int(tight_ymax) + padding_y_bottom)
+                    
+                    crop = None
+                    if ymax > ymin and xmax > xmin:
+                        crop = image[ymin:ymax, xmin:xmax]
+                    
+                    elements.append({
+                        "text": text,
+                        "score": score,
+                        "bbox": [tight_xmin, tight_ymin, tight_xmax, tight_ymax],
+                        "center": [
+                            (tight_xmin + tight_xmax) / 2,
+                            (tight_ymin + tight_ymax) / 2
+                        ],
+                        "height": tight_ymax - tight_ymin,
+                        "crop": crop
+                    })
+            return elements
+        except Exception as e:
+            logger.error(f"RapidOCR recognize_lines failed: {e}")
+            return []
+
+    def recognize_crop_vietocr(self, crop: np.ndarray) -> str:
+        """Recognize text from a single crop image using VietOCR ONNX model."""
+        try:
+            global _SHARED_VIETOCR_PREDICTOR
+            if _SHARED_VIETOCR_PREDICTOR is None:
+                from src.ocr.onnx_predictor import ONNXPredictor
+                _SHARED_VIETOCR_PREDICTOR = ONNXPredictor('vgg_seq2seq')
+
+            self.vietocr_predictor = _SHARED_VIETOCR_PREDICTOR
+
+            from PIL import Image
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(crop_rgb)
+
+            text = self.vietocr_predictor.predict(pil_img)
+            return text.strip()
+        except Exception as e:
+            logger.error(f"VietOCR ONNX recognize_crop failed: {e}")
+            return ""
 
     def recognize_tesseract(
         self,
