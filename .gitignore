@@ -70,3 +70,4 @@ resources/gplx/
 resources/gtx/
 
 benchmarks/results/*.json
+.tokensave

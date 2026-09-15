@@ -21,6 +21,12 @@ def discover_dataset(resources_dir: Path) -> List[Dict[str, Any]]:
     expect_files = list(resources_dir.rglob("*_expect.json"))
     expect_files.extend(resources_dir.rglob("*_expected.json"))
     
+    if not expect_files:
+        alt_dir = Path("/home/ubuntu/my_projects/tiny-vn-ocr/resources")
+        if alt_dir.exists():
+            expect_files = list(alt_dir.rglob("*_expect.json"))
+            expect_files.extend(alt_dir.rglob("*_expected.json"))
+    
     for expect_file in sorted(set(expect_files)):
         stem = expect_file.stem.replace("_expect", "").replace("_expected", "")
         parent_dir = expect_file.parent

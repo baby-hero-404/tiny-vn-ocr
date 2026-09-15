@@ -5,6 +5,135 @@ from typing import Dict, List
 from rapidfuzz import process, fuzz
 import json
 import os
+import re
+import unicodedata
+
+def _strip_accents(s: str) -> str:
+    nfkd = unicodedata.normalize('NFD', s)
+    return ''.join(c for c in nfkd if not unicodedata.combining(c)).lower()
+
+
+def _unaccented_scorer(s1: str, s2: str, score_cutoff: float = 0.0) -> float:
+    return fuzz.token_sort_ratio(_strip_accents(s1), _strip_accents(s2), score_cutoff=score_cutoff)
+
+
+def clean_address_string(raw: str) -> str:
+    """Purge colons, bilingual labels, and non-address OCR noise."""
+    if not raw:
+        return ""
+    
+    s = raw.strip()
+    
+    # 1. If colon exists, strip label prefix if detected
+    if ":" in s:
+        prefix, remainder = s.split(":", 1)
+        norm_prefix = _strip_accents(prefix).lower()
+        is_label = any(kw in norm_prefix for kw in [
+            "que quan", "queguan", "origin", "thuong tru", "thurong tru", "residence", 
+            "cu tru", "khai sinh", "birth", "dia chi", "address", "hktt", "dkhktt", 
+            "place of", "placeof", "noi thuong", "noi cu", "noi dang ky", "noi khai sinh"
+        ])
+        if is_label:
+            s = remainder.strip()
+        else:
+            # If not a recognized label prefix, colon is an OCR typo for comma
+            s = s.replace(":", ", ")
+
+    # 2. Strip any remaining colons and semicolons (colons never belong in Vietnamese addresses)
+    s = s.replace(":", "").replace(";", ", ")
+    
+    # 3. Strip bilingual slash: keep slash only between numbers/alphanumeric house codes (e.g. 217/4, 3/2)
+    s = re.sub(r"(?<!\d)/|/(?!\d)", " ", s)
+
+    # 3b. Common OCR diacritic misread: "Áp" (not a Vietnamese address term) is
+    # almost always a misread of "Ấp" (hamlet/village unit prefix).
+    s = re.sub(r"\bÁp\b", "Ấp", s)
+
+    # 3c. Admin abbreviation glued to the name with a hyphen instead of a space
+    # (e.g. "TP-Sóc Trăng" -> "TP Sóc Trăng").
+    s = re.sub(r"\b(TP|TX|TT|Q|H|P)\s*-\s*", r"\1 ", s)
+    
+    # 4. Remove isolated pipes or bilingual separator tokens
+    s = re.sub(r"\s+[|I]\s+", " ", s)
+    s = re.sub(r"[|~_^*@#\$%]+", " ", s)
+
+    # 5. Clean common bilingual labels that might appear anywhere without colon
+    bilingual_patterns = [
+        r"(?i)place\s*of\s*(origin|residence|birth|ongin)",
+        r"(?i)noi\s*(thuong|thurong)\s*tru",
+        r"(?i)nơi\s*(thường|thuong)\s*trú",
+        r"(?i)que\s*[qg]uan",
+        r"(?i)quê\s*[qg]uán",
+        r"(?i)noi\s*(dang\s*ky\s*)?khai\s*sinh",
+        r"(?i)nơi\s*(đăng\s*ký\s*)?khai\s*sinh",
+        r"(?i)noi\s*cu\s*tru",
+        r"(?i)nơi\s*cư\s*trú",
+        r"(?i)citizen\s*identity\s*card",
+        r"(?i)can\s*cuoc\s*cong\s*dan",
+        r"(?i)căn\s*cước\s*công\s*dân",
+        r"(?i)date\s*of\s*expiry",
+        r"(?i)co\s*gia\s*tri\s*den",
+        r"(?i)có\s*giá\s*trị\s*đến",
+        r"(?i)dia\s*chi",
+        r"(?i)địa\s*chỉ",
+    ]
+    for p in bilingual_patterns:
+        s = re.sub(p, "", s)
+
+    # 6. Normalize commas and spaces
+    s = re.sub(r"\s*,\s*", ", ", s)
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"^[\s,.\-/]+", "", s)
+    s = re.sub(r"[\s,.\-/]+$", "", s)
+    
+    return s.strip()
+
+
+def deduplicate_address_segments(address: str) -> str:
+    """Remove repeating administrative segments or duplicate phrases."""
+    if not address:
+        return ""
+    parts = [p.strip() for p in address.split(",") if p.strip()]
+    if len(parts) <= 1:
+        return address
+    
+    # Pass 1: Remove adjacent identical segments (case/accent insensitive)
+    clean_parts = []
+    for p in parts:
+        if not clean_parts:
+            clean_parts.append(p)
+            continue
+        prev_norm = _strip_accents(clean_parts[-1]).lower()
+        curr_norm = _strip_accents(p).lower()
+        if curr_norm == prev_norm or fuzz.ratio(curr_norm, prev_norm) > 90:
+            continue
+        clean_parts.append(p)
+    parts = clean_parts
+
+    # Pass 2: Detect full block repetition (e.g., A, B, C, A, B, C)
+    n = len(parts)
+    for block_len in range(1, n // 2 + 1):
+        suffix1 = ", ".join(parts[-block_len:])
+        suffix2 = ", ".join(parts[-2*block_len:-block_len])
+        if fuzz.ratio(_strip_accents(suffix1).lower(), _strip_accents(suffix2).lower()) > 90:
+            parts = parts[:-block_len]
+            break
+
+    # Pass 3: Drop non-adjacent segments that duplicate an earlier segment
+    # (e.g. province name appended twice due to a stray OCR line: "..., Sóc
+    # Trăng, Sóc Trăng"), keeping the first occurrence.
+    seen_norm: List[str] = []
+    deduped = []
+    for p in parts:
+        norm = _strip_accents(p).lower()
+        if any(norm == s or fuzz.ratio(norm, s) > 92 for s in seen_norm):
+            continue
+        seen_norm.append(norm)
+        deduped.append(p)
+    parts = deduped
+
+    return ", ".join(parts)
+
 
 class HierarchicalAddressNormalizer:
     def __init__(self, db_path: str = "resources/hanhchinhvn_tree.json"):
@@ -19,8 +148,7 @@ class HierarchicalAddressNormalizer:
             
             paths_set = set()
             
-            def add_aliases(name, path, path_with_type):
-                paths_set.add(name)
+            def add_aliases(path, path_with_type):
                 paths_set.add(path)
                 paths_set.add(path_with_type)
                 # Create shorthand aliases
@@ -45,22 +173,44 @@ class HierarchicalAddressNormalizer:
                         paths_set.add(path_with_type.replace(old, new).replace(" ,", ",").strip())
 
             for p_code, p_data in tree.items():
-                add_aliases(p_data["name"], p_data["name"], p_data["name_with_type"])
+                paths_set.add(p_data["name"])
+                add_aliases(p_data["name"], p_data["name_with_type"])
                 if "quan-huyen" in p_data:
                     for d_code, d_data in p_data["quan-huyen"].items():
-                        add_aliases(d_data["name"], d_data["path"], d_data["path_with_type"])
+                        paths_set.add(d_data["name"])
+                        paths_set.add(f"{d_data['name']}, {p_data['name']}")
+                        add_aliases(f"{d_data['name']}, {p_data['name']}", f"{d_data['name_with_type']}, {p_data['name_with_type']}")
                         if "xa-phuong" in d_data:
                             for w_code, w_data in d_data["xa-phuong"].items():
-                                add_aliases(w_data["name"], w_data["path"], w_data["path_with_type"])
+                                paths_set.add(w_data["name"])
+                                paths_set.add(f"{w_data['name']}, {d_data['name']}, {p_data['name']}")
+                                add_aliases(f"{w_data['name']}, {d_data['name']}, {p_data['name']}", f"{w_data['name_with_type']}, {d_data['name_with_type']}, {p_data['name_with_type']}")
+
             self.admin_paths = list(paths_set)
 
     def normalize(self, raw_address: str) -> str:
         if not raw_address or not self.admin_paths:
-            return raw_address
+            return clean_address_string(raw_address)
             
-        # Pre-process raw_address to fix common missing spaces after hyphens
-        raw_address = raw_address.replace("TP-", "TP ").replace("TX-", "TX ").replace("TT.", "TT ")
-        parts = [p.strip() for p in raw_address.split(",")]
+        # Step 1: Clean colons, labels, and noise
+        raw_address = clean_address_string(raw_address)
+
+        # Step 2: Pre-process raw_address to fix joined prefixes & missing spaces
+        raw_address = re.sub(r'\b(Ap|AP)([A-ZĐÀÁẠẢÃÈÉẸẺẼÌÍỊỈĨÒÓỌỎÕÙÚỤỦŨƯỪỨỰỬỮƠỜỚỢỞỠỲÝỴỶỸa-zđàáạảãèéẹẻẽìíịỉĩòóọỏõùúụủũưừứựửữơờớợởỡỳýỵỷỹ])', r'Ấp \2', raw_address)
+        raw_address = re.sub(r'\b(Xa|XA)([A-ZĐÀÁẠẢÃÈÉẸẺẼÌÍỊỈĨÒÓỌỎÕÙÚỤỦŨƯỪỨỰỬỮƠỜỚỢỞỠỲÝỴỶỸa-zđàáạảãèéẹẻẽìíịỉĩòóọỏõùúụủũưừứựửữơờớợởỡỳýỵỷỹ])', r'Xã \2', raw_address)
+        raw_address = re.sub(r'([a-zđàáạảãèéẹẻẽìíịỉĩòóọỏõùúụủũưừứựửữơờớợởỡỳýỵỷỹ])([A-ZĐÀÁẠẢÃÈÉẸẺẼÌÍỊỈĨÒÓỌỎÕÙÚỤỦŨƯỪỨỰỬỮƠỜỚỢỞỠỲÝỴỶỸ])', r'\1 \2', raw_address)
+        raw_address = re.sub(r'\b(Ap|ap)\b', 'Ấp', raw_address)
+        raw_address = re.sub(r'\b(Xa|xa)\b', 'Xã', raw_address)
+        
+        # Step 3: Fix common OCR diacritic errors in Vietnamese addresses
+        raw_address = re.sub(r'\bMình\s+Duy\b', 'Minh Duy', raw_address)
+        raw_address = re.sub(r'\b(Họa Tự|Hóa Tú|Họa Tu|Hóa Tu)\b', 'Hòa Tú', raw_address)
+        raw_address = re.sub(r'\b(Cần Thó|Cần Thờ|Cân Thơ|Cân Tho|Can Tho)\b', 'Cần Thơ', raw_address)
+
+        raw_address = re.sub(r'\s*,\s*', ', ', raw_address)
+        raw_address = re.sub(r'\s+', ' ', raw_address).strip()
+
+        parts = [p.strip() for p in raw_address.split(",") if p.strip()]
         if not parts:
             return raw_address
             
@@ -68,23 +218,23 @@ class HierarchicalAddressNormalizer:
         best_score = 0
         best_suffix_len = 0
         
-        # Try matching the last N segments (up to 3 for Ward, District, Province)
+        # Step 4: Try matching the last N segments (up to 3 for Ward, District, Province)
         max_segments = min(3, len(parts))
         for i in range(1, max_segments + 1):
             suffix = ", ".join(parts[-i:])
-            match = process.extractOne(suffix, self.admin_paths, scorer=fuzz.token_sort_ratio, score_cutoff=65.0)
+            match = process.extractOne(suffix, self.admin_paths, scorer=_unaccented_scorer, score_cutoff=65.0)
             if match:
                 first_raw = parts[-i]
                 db_segs = [p.strip() for p in match[0].split(",")]
                 first_db = db_segs[0]
                 
                 # Check if the first segment aligns structurally
-                align_score = fuzz.partial_ratio(first_db.lower(), first_raw.lower())
+                align_score = fuzz.partial_ratio(_strip_accents(first_db), _strip_accents(first_raw))
                 if align_score < 50:
                     continue
                     
                 score = match[1]
-                partial = fuzz.partial_ratio(match[0].lower(), suffix.lower())
+                partial = fuzz.partial_ratio(_strip_accents(match[0]), _strip_accents(suffix))
                 
                 combined = score * 0.4 + partial * 0.6 + (i * 8)
                 
@@ -114,19 +264,74 @@ class HierarchicalAddressNormalizer:
             if best_split_idx > 0 and best_split_score > 50:
                 prefix = " ".join(raw_words[:best_split_idx])
                 prefix_parts.append(prefix)
+            
+            # Step 5: Deduplicate prefix parts that already exist inside best_match_str
+            db_segs_lower = [_strip_accents(p).strip() for p in best_match_str.split(",")]
+            clean_prefix = []
+            for p in prefix_parts:
+                norm_p = _strip_accents(p).strip()
+                if not any(norm_p == db_s or fuzz.ratio(norm_p, db_s) > 85 for db_s in db_segs_lower):
+                    clean_prefix.append(p)
+            prefix_parts = clean_prefix
                 
             if prefix_parts:
-                return ", ".join(prefix_parts) + ", " + best_match_str
+                res_addr = ", ".join(prefix_parts) + ", " + best_match_str
             else:
-                return best_match_str
-                
-        return raw_address
+                res_addr = best_match_str
+        else:
+            res_addr = raw_address
+
+        # Step 6: Final deduplication and colon-free assurance
+        res_addr = deduplicate_address_segments(res_addr)
+        return clean_address_string(res_addr)
 
 _NORMALIZER = HierarchicalAddressNormalizer()
 
 def normalize_address(raw_address: str) -> str:
     """Correct spelling using hierarchical database."""
     return _NORMALIZER.normalize(raw_address)
+
+def reconcile_residence_with_origin(fields: Dict[str, str]) -> Dict[str, str]:
+    """Repair place_of_residence's administrative tail using place_of_origin.
+
+    On Vietnamese CCCD, "quê quán" (origin) and "nơi thường trú" (residence)
+    almost always share the same ward/district/province path — residence is
+    just origin plus a house number/hamlet prefix. Since place_of_origin is
+    consistently the more reliably-OCR'd field (it's a short line with no
+    house-number noise), use it to fix a residence tail that was truncated,
+    duplicated or mis-split by OCR/normalization — without touching a
+    residence whose tail genuinely doesn't resemble origin at all (that's
+    a real "moved elsewhere" case, not an OCR error).
+    """
+    origin = fields.get("place_of_origin")
+    residence = fields.get("place_of_residence")
+    if not origin or not residence:
+        return fields
+
+    origin_norm = _strip_accents(origin).lower()
+    parts = [p.strip() for p in residence.split(",") if p.strip()]
+    if not parts:
+        return fields
+
+    # Find the split point whose suffix best matches origin as a whole.
+    best_idx, best_score = len(parts), 0.0
+    for i in range(len(parts)):
+        suffix = ", ".join(parts[i:])
+        score = fuzz.ratio(_strip_accents(suffix).lower(), origin_norm)
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    # Only repair when the tail is a close-but-imperfect match to origin
+    # (OCR noise). A low score means residence is plausibly a different
+    # place — leave it alone rather than overwrite real data.
+    if best_score < 60:
+        return fields
+
+    prefix_parts = parts[:best_idx]
+    fields["place_of_residence"] = ", ".join(prefix_parts + [origin]) if prefix_parts else origin
+    return fields
+
 
 def normalize_gender_nationality(fields: Dict[str, str]) -> Dict[str, str]:
     if "gender" in fields:

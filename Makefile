@@ -1,8 +1,8 @@
 .PHONY: install run test clean benchmarks
 
-# Install dependencies using uv
+# Install dependencies using uv with Python 3.12
 install:
-	uv venv
+	uv venv --clear --python 3.12
 	uv pip install -r requirements.txt
 
 # Run the FastAPI server

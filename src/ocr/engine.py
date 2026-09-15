@@ -7,8 +7,6 @@ import unicodedata
 import numpy as np
 import cv2
 
-from src.preprocessing.filters import enhance_image_for_detection
-
 logger = logging.getLogger(__name__)
 
 _FIXED_BANNERS = (
@@ -95,7 +93,10 @@ class OCREngine:
     """Unified OCR Engine with primary ONNX RapidOCR and Tesseract fallback."""
 
     def __init__(self, rapidocr_kwargs: Optional[Dict[str, Any]] = None):
-        self._rapidocr_kwargs = rapidocr_kwargs or {}
+        default_kwargs = {"det_limit_side_len": 1600}
+        if rapidocr_kwargs:
+            default_kwargs.update(rapidocr_kwargs)
+        self._rapidocr_kwargs = default_kwargs
         self._rapidocr = None
         self._rapidocr_initialized = False
         self._tesseract_available = False
@@ -110,6 +111,9 @@ class OCREngine:
     @property
     def rapidocr_engine(self):
         """Lazy-load RapidOCR engine instance as a singleton."""
+        if self._rapidocr is not None:
+            return self._rapidocr
+
         global _SHARED_RAPIDOCR_ENGINE
         if _SHARED_RAPIDOCR_ENGINE is not None:
             return _SHARED_RAPIDOCR_ENGINE
@@ -238,8 +242,7 @@ class OCREngine:
 
                     if ymax > ymin and xmax > xmin and _should_refine_with_vietocr(rapid_text):
                         crop = image[ymin:ymax, xmin:xmax]
-                        crop_enhanced = enhance_image_for_detection(crop)
-                        crop_rgb = cv2.cvtColor(crop_enhanced, cv2.COLOR_BGR2RGB)
+                        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
                         pil_img = Image.fromarray(crop_rgb)
 
                         refined = self.vietocr_predictor.predict(pil_img)
@@ -308,8 +311,7 @@ class OCREngine:
                         crop = image[ymin:ymax, xmin:xmax]
 
                         if _should_refine_with_vietocr(rapid_text):
-                            crop_enhanced = enhance_image_for_detection(crop)
-                            crop_rgb = cv2.cvtColor(crop_enhanced, cv2.COLOR_BGR2RGB)
+                            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
                             pil_img = Image.fromarray(crop_rgb)
 
                             refined = self.vietocr_predictor.predict(pil_img)

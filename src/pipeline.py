@@ -54,6 +54,13 @@ class DocumentOCRPipeline:
         if image is None or image.size == 0:
             raise ValueError("Invalid or empty input image provided.")
 
+        # Fast downscale if image is too large (e.g. camera photo > 1600px)
+        h, w = image.shape[:2]
+        if max(h, w) > 1600:
+            scale = 1600.0 / max(h, w)
+            import cv2
+            image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
         doc_key = document_type.lower()
         if doc_key == "cccd_front":
             doc_key = "cccd"
@@ -68,7 +75,7 @@ class DocumentOCRPipeline:
                 from src.postprocessing.layout_parser import layout_parse
                 from src.postprocessing.vn_name_dict import correct_full_name
                 from src.postprocessing.cccd_rules import validate_and_fix_expiry
-                from src.postprocessing.address_norm import normalize_gender_nationality, normalize_address
+                from src.postprocessing.address_norm import normalize_gender_nationality, normalize_address, reconcile_residence_with_origin
 
                 # 1. OCR with bboxes
                 elements = self.ocr_engine.recognize_lines_vietocr_with_bboxes(image)
@@ -92,6 +99,7 @@ class DocumentOCRPipeline:
                         extracted_fields["place_of_origin"] = normalize_address(extracted_fields["place_of_origin"])
                     if "place_of_residence" in extracted_fields:
                         extracted_fields["place_of_residence"] = normalize_address(extracted_fields["place_of_residence"])
+                    extracted_fields = reconcile_residence_with_origin(extracted_fields)
                 elif actual_side == "cccd_back":
                     if "place_of_birth" in extracted_fields:
                         extracted_fields["place_of_birth"] = normalize_address(extracted_fields["place_of_birth"])
@@ -107,6 +115,22 @@ class DocumentOCRPipeline:
                 engines_used = {"rapidocr"}
                 extracted_fields = parse_document(lines, doc_key)
                 field_confidences = [0.85] * len(extracted_fields)
+
+            # If layout parser found nothing (e.g. synthetic test image or mocked unit test), fallback to ROI extractor
+            if not extracted_fields and doc_key in ("cccd", "cccd_front"):
+                try:
+                    aligned_image = align_document(image, template_image)
+                    rois = self.roi_extractor.extract_rois(aligned_image, doc_key)
+                    for field_name, crop in rois.items():
+                        if crop is not None and crop.size > 0:
+                            raw_text, conf, engine_name = self.ocr_engine.recognize(crop, field_type=field_name)
+                            if raw_text:
+                                extracted_fields[field_name] = raw_text
+                                engines_used.add(engine_name)
+                                if conf > 0:
+                                    field_confidences.append(conf)
+                except Exception as e:
+                    logger.debug(f"ROI fallback failed: {e}")
         else:
             # Fallback to old ROI extraction for other documents
             # 1. Image alignment (ORB Homography)
@@ -177,14 +201,31 @@ class DocumentOCRPipeline:
         if image_a is None or image_a.size == 0 or image_b is None or image_b.size == 0:
             raise ValueError("Both images must be valid and non-empty for dual-image processing.")
 
+        # Fast downscale if images are too large (e.g. camera photo > 1600px)
+        import cv2
+        h_a, w_a = image_a.shape[:2]
+        if max(h_a, w_a) > 1600:
+            scale_a = 1600.0 / max(h_a, w_a)
+            image_a = cv2.resize(image_a, (int(w_a * scale_a), int(h_a * scale_a)), interpolation=cv2.INTER_AREA)
+
+        h_b, w_b = image_b.shape[:2]
+        if max(h_b, w_b) > 1600:
+            scale_b = 1600.0 / max(h_b, w_b)
+            image_b = cv2.resize(image_b, (int(w_b * scale_b), int(h_b * scale_b)), interpolation=cv2.INTER_AREA)
+
         doc_key = document_type.lower()
         if doc_key in ("cccd_front", "cccd_back"):
             doc_key = "cccd"
 
         try:
-            # 1. OCR with bboxes on both images
-            elements_a = self.ocr_engine.recognize_lines_vietocr_with_bboxes(image_a)
-            elements_b = self.ocr_engine.recognize_lines_vietocr_with_bboxes(image_b)
+            # 1. OCR with bboxes on both images concurrently (parallel dual-side execution)
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_a = executor.submit(self.ocr_engine.recognize_lines_vietocr_with_bboxes, image_a)
+                future_b = executor.submit(self.ocr_engine.recognize_lines_vietocr_with_bboxes, image_b)
+                elements_a = future_a.result()
+                elements_b = future_b.result()
 
             # Auto-detect which image is Front and which is Back based on affinity
             affinity_a = self._get_cccd_side_affinity(elements_a)
@@ -200,7 +241,7 @@ class DocumentOCRPipeline:
             from src.postprocessing.layout_parser import layout_parse
             from src.postprocessing.vn_name_dict import correct_full_name
             from src.postprocessing.cccd_rules import validate_and_fix_expiry
-            from src.postprocessing.address_norm import normalize_gender_nationality, normalize_address
+            from src.postprocessing.address_norm import normalize_gender_nationality, normalize_address, reconcile_residence_with_origin
 
             # 2. Extract Front Side
             front_fields = layout_parse(front_elems, "cccd_front", image=front_img, ocr_engine=self.ocr_engine)
@@ -233,6 +274,11 @@ class DocumentOCRPipeline:
             # Fallback for residence: if front didn't have it but back does (new CCCD format)
             if not merged_fields.get("place_of_residence") and back_fields.get("place_of_residence"):
                 merged_fields["place_of_residence"] = back_fields["place_of_residence"]
+
+            merged_fields = reconcile_residence_with_origin(merged_fields)
+
+            # Final CCCD cross-validation and expiry rule check on merged fields
+            merged_fields = validate_and_fix_expiry(merged_fields)
 
             # Normalize all fields
             validated_fields = {}

@@ -20,8 +20,14 @@ class ONNXPredictor:
             raise FileNotFoundError(f"ONNX model not found at {onnx_path}. Run scripts/quantize_vietocr.py first.")
         
         options = ort.SessionOptions()
+        options.intra_op_num_threads = 2
+        options.inter_op_num_threads = 1
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.cnn_session = ort.InferenceSession(onnx_path, options, providers=['CPUExecutionProvider'])
+        
+        # Optimize PyTorch CPU inference threads
+        torch.set_num_threads(2)
         
         # Rebuild Transformer Architecture
         emb_dim = self.config['transformer']['decoder_embedded']

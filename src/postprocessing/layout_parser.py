@@ -6,16 +6,25 @@ from typing import Dict, List, Any, Optional, Tuple
 
 from rapidfuzz import fuzz
 
+from src.postprocessing.cccd_id_utils import infer_birth_year_and_gender
+
 date_pattern = re.compile(r'\d{2}[/.\-]\d{2}[/.\-]\d{4}')
 
 
 def extract_mangled_date(text: str) -> str:
-    match = re.search(r'\d{2}[/.\-]\d{2}[/.\-]\d{4}', text)
-    if match:
-        return match.group(0).replace(".", "/").replace("-", "/")
-    match = re.search(r'\b\d{4,5}[/.\-]\d{4}\b|\b\d{2}[/.\-]\d{6,7}\b', text)
-    if match:
-        d_clean = re.sub(r'[^\d]', '', match.group(0))
+    if not text:
+        return ""
+    # Clean space between separated digits and slashes (e.g. '0 1/05/2021' -> '01/05/2021')
+    clean = re.sub(r'(\d)\s+(\d)', r'\1\2', text)
+    clean = re.sub(r'(\d)\s*[/.\-]\s*(\d)', r'\1/\2', clean)
+    m = re.search(r'(?:[^\d]|^)(\d{1,2})/(\d{1,2})/(\d{4})', clean)
+    if m:
+        d, mth, y = m.group(1), m.group(2), m.group(3)
+        if 1 <= int(d) <= 31 and 1 <= int(mth) <= 12 and 1900 <= int(y) <= 2099:
+            return f"{int(d):02d}/{int(mth):02d}/{y}"
+    m_loose = re.search(r'\b\d{4,5}[/.\-]\d{4}\b|\b\d{2}[/.\-]\d{6,7}\b', text)
+    if m_loose:
+        d_clean = re.sub(r'[^\d]', '', m_loose.group(0))
         if len(d_clean) >= 8:
             return f"{d_clean[:2]}/{d_clean[2:4]}/{d_clean[-4:]}"
     return ""
@@ -38,23 +47,26 @@ def _strip_accents(s: str) -> str:
 # Step 2: Label detection
 # ============================================================
 
-# Front-side labels
+# Front-side labels. Keep only the canonical Vietnamese/English wording plus
+# genuinely distinct alternate phrasings here — OCR *typo* variants of these
+# (missing spaces, misread letters) are handled generically by the fuzzy
+# fallback in _classify_line, not by hardcoding every misread we've seen.
 FRONT_LABELS = {
     "id_number":    ["so", "no", "dinh danh", "personal identification"],
-    "full_name":    ["ho va ten", "full name", "ho ten"],
-    "dob":          ["ngay sinh", "date of birth"],
+    "full_name":    ["ho va ten", "full name", "ho ten", "ho, chu dem va ten"],
+    "dob":          ["ngay sinh", "date of birth", "ngay, thang, nam sinh", "ngay thang nam sinh", "nam sinh", "birth"],
     "gender_nat":   ["gioi tinh", "sex", "quoc tich", "nationality"],
     "origin":       ["que quan", "place of origin"],
-    "residence":    ["thuong tru", "place of residence", "noi thuong"],
-    "expiry":       ["co gia tri", "date of expiry", "het han"],
+    "residence":    ["thuong tru", "place of residence", "noi cu tru", "cu tru"],
+    "expiry":       ["co gia tri den", "co gia tri", "date of expiry", "het han", "gia tri den"],
 }
 
 # Back-side labels
 BACK_LABELS = {
-    "residence":    ["noi cu tru", "noi cum", "place of residence", "cu tru"],
+    "residence":    ["noi cu tru", "place of residence", "cu tru"],
     "birth_place":  ["khai sinh", "place of birth", "dang ky khai"],
     "issue_date":   ["ngay thang nam", "date of issue", "ngay cap", "date,month"],
-    "expiry_date":  ["het han", "date of expiry", "ofexpity", "ofespity"],
+    "expiry_date":  ["het han", "date of expiry"],
     "issuer":       ["bo cong an", "ministry", "cuc canh sat", "cuc truong", "giam doc"],
 }
 
@@ -63,6 +75,16 @@ def _classify_line(text: str, label_set: Dict[str, List[str]]) -> Optional[str]:
     """Return the label key if this line contains a label, else None."""
     norm = _strip_accents(text).lower()
     norm_padded = f" {norm} "
+
+    # Priority check for dob vs other labels (front-side only — BACK_LABELS has
+    # no "dob" key and uses "khai sinh"/"birth_place" for birth-related lines)
+    if "dob" in label_set and "sinh" in norm and not any(w in norm for w in ["khai sinh", "noi sinh"]):
+        if any(w in norm for w in ["ngay", "nam", "thang", "birth", "date"]):
+            return "dob"
+
+    # Pass 1: exact / substring match against canonical keywords — always
+    # wins over fuzzy, and runs across all keys first so an early key's
+    # fuzzy score can't preempt a later key's exact match.
     for key, keywords in label_set.items():
         for kw in keywords:
             if f" {kw} " in norm_padded:
@@ -71,8 +93,20 @@ def _classify_line(text: str, label_set: Dict[str, List[str]]) -> Optional[str]:
                 return key
             if norm == kw:
                 return key
-            if len(kw) > 5 and fuzz.partial_ratio(kw, norm) > 85:
-                return key
+
+    # Pass 2: fuzzy fallback for OCR misreads of a canonical keyword (missing
+    # spaces, swapped/dropped letters) — generalizes to typos we haven't seen
+    # before instead of requiring every variant to be hardcoded.
+    best_key, best_score = None, 0.0
+    for key, keywords in label_set.items():
+        for kw in keywords:
+            if len(kw) < 8:
+                continue
+            score = fuzz.partial_ratio(kw, norm)
+            if score > best_score:
+                best_key, best_score = key, score
+    if best_score > 70:
+        return best_key
     return None
 
 
@@ -219,12 +253,39 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
             if val:
                 fields["date_of_birth"] = val
             else:
-                # Check next line
-                if idx + 1 < len(tagged):
-                    val = extract_mangled_date(tagged[idx + 1][2]["text"])
-                    if val:
-                        fields["date_of_birth"] = val
+                # Check next 1-2 lines
+                for next_offset in (1, 2):
+                    if idx + next_offset < len(tagged):
+                        val = extract_mangled_date(tagged[idx + next_offset][2]["text"])
+                        if val:
+                            fields["date_of_birth"] = val
+                            break
             break
+
+    # DOB Fallback: Cross-check with CCCD ID or dates with year < 2015
+    if "date_of_birth" not in fields:
+        all_dates = date_pattern.findall(full_text)
+        id_num = fields.get("id_number", "")
+        id_info = infer_birth_year_and_gender(id_num)
+        expected_birth_year = id_info[0] if id_info else None
+
+        if expected_birth_year:
+            for d in all_dates:
+                d_norm = d.replace(".", "/").replace("-", "/")
+                if d_norm.endswith(f"/{expected_birth_year}"):
+                    fields["date_of_birth"] = d_norm
+                    break
+
+        if "date_of_birth" not in fields:
+            for d in all_dates:
+                d_norm = d.replace(".", "/").replace("-", "/")
+                try:
+                    yr = int(d_norm.split("/")[-1])
+                    if yr < 2015:
+                        fields["date_of_birth"] = d_norm
+                        break
+                except (ValueError, IndexError):
+                    pass
 
     # --- Gender & Nationality ---
     for idx, key, el in tagged:
@@ -289,9 +350,17 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
         parts = []
         
         # Extract inline value by stripping all label keywords
-        text_clean = _strip_all_labels(start_el["text"])
-        if text_clean and len(text_clean) > 3 and not _is_garbage(text_clean):
-            parts.append(text_clean)
+        # If line has colon, value is strictly after colon. Otherwise check if non-label address text remains.
+        if ":" in start_el["text"]:
+            after_colon = _strip_all_labels(start_el["text"].split(":", 1)[1]).strip()
+            if after_colon and len(after_colon) > 3 and not _is_garbage(after_colon):
+                parts.append(after_colon)
+        else:
+            text_clean = _strip_all_labels(start_el["text"]).strip()
+            if text_clean and len(text_clean) > 3 and not _is_garbage(text_clean):
+                norm_clean = _strip_accents(text_clean).lower()
+                if norm_clean not in ("que quan", "queguan", "place of origin", "placeoforigin", "noi thuong tru", "place of residence", "noi thurong tru"):
+                    parts.append(text_clean)
 
         # Collect lines below the label, same X column
         for j in range(start_idx + 1, len(tagged)):
@@ -319,10 +388,18 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
             if _is_garbage(text):
                 continue
 
+            # Deduplication: do not append identical or duplicate lines
+            norm_text = _strip_accents(text).lower()
+            if any(norm_text == _strip_accents(p).lower() or fuzz.ratio(norm_text, _strip_accents(p).lower()) > 85 for p in parts):
+                continue
+
             parts.append(text)
 
         address = " ".join(parts).strip()
         address = address.replace(" ,", ",").strip()
+        from src.postprocessing.address_norm import clean_address_string, deduplicate_address_segments
+        address = clean_address_string(address)
+        address = deduplicate_address_segments(address)
         # Final sanity: if result doesn't look like an address, return empty
         if address and not _looks_like_address(address):
             return ""
@@ -347,15 +424,20 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
                         fields["date_of_expiry"] = val
             break
 
-    # Expiry fallback: find all dates, take the last one that isn't DOB
+    # Expiry fallback: find all dates, take the last one that isn't DOB and has year >= 2015
     if "date_of_expiry" not in fields:
         all_dates = date_pattern.findall(full_text)
         dob = fields.get("date_of_birth", "")
         for d in reversed(all_dates):
             d_norm = d.replace(".", "/").replace("-", "/")
             if d_norm != dob:
-                fields["date_of_expiry"] = d_norm
-                break
+                try:
+                    yr = int(d_norm.split("/")[-1])
+                    if yr >= 2015:
+                        fields["date_of_expiry"] = d_norm
+                        break
+                except (ValueError, IndexError):
+                    pass
 
     return fields
 
@@ -385,6 +467,17 @@ def parse_cccd_back(elements: List[Dict]) -> Dict[str, str]:
         key = _classify_line(el["text"], BACK_LABELS)
         tagged.append((i, key, el))
 
+    # 0. Fast MRZ Extraction (TD1 format on CCCD back)
+    try:
+        from src.postprocessing.mrz_parser import parse_mrz_lines
+        raw_texts = [el["text"] for el in lines]
+        mrz_data = parse_mrz_lines(raw_texts)
+        for k, v in mrz_data.items():
+            if v:
+                fields[k] = v
+    except Exception:
+        pass
+
     # --- Residence ---
     for idx, key, el in tagged:
         if key == "residence":
@@ -401,7 +494,7 @@ def parse_cccd_back(elements: List[Dict]) -> Dict[str, str]:
                     continue
                 parts.append(text)
             if parts:
-                val = " ".join(parts)
+                val = ", ".join(p.strip().rstrip(",") for p in parts if p.strip())
                 val = _strip_all_labels(val)
                 fields["place_of_residence"] = val.replace(" ,", ",").strip()
             break
@@ -421,34 +514,45 @@ def parse_cccd_back(elements: List[Dict]) -> Dict[str, str]:
                     continue
                 parts.append(text)
             if parts:
-                val = " ".join(parts)
+                val = ", ".join(p.strip().rstrip(",") for p in parts if p.strip())
                 val = _strip_all_labels(val)
                 fields["place_of_birth"] = val.replace(" ,", ",").strip()
             break
 
     # --- Date of Issue ---
-    for idx, key, el in tagged:
-        if key == "issue_date":
-            match = date_pattern.search(el["text"])
-            if match:
-                fields["date_of_issue"] = match.group(0).replace(".", "/").replace("-", "/")
-            elif idx + 1 < len(tagged):
-                match = date_pattern.search(tagged[idx + 1][2]["text"])
-                if match:
-                    fields["date_of_issue"] = match.group(0).replace(".", "/").replace("-", "/")
-            break
+    if "date_of_issue" not in fields:
+        for idx, key, el in tagged:
+            if key == "issue_date":
+                val = extract_mangled_date(el["text"])
+                if not val and idx + 1 < len(tagged):
+                    val = extract_mangled_date(tagged[idx + 1][2]["text"])
+                if val:
+                    fields["date_of_issue"] = val
+                break
+
+    # Fallback for date_of_issue: scan any date on back side between 2014 and 2026
+    if "date_of_issue" not in fields:
+        for el in lines:
+            val = extract_mangled_date(el["text"])
+            if val and val != fields.get("date_of_expiry"):
+                try:
+                    yr = int(val.split("/")[-1])
+                    if 2014 <= yr <= 2026:
+                        fields["date_of_issue"] = val
+                        break
+                except (ValueError, IndexError):
+                    pass
 
     # --- Date of Expiry ---
-    for idx, key, el in tagged:
-        if key == "expiry_date":
-            match = date_pattern.search(el["text"])
-            if match:
-                fields["date_of_expiry"] = match.group(0).replace(".", "/").replace("-", "/")
-            elif idx + 1 < len(tagged):
-                match = date_pattern.search(tagged[idx + 1][2]["text"])
-                if match:
-                    fields["date_of_expiry"] = match.group(0).replace(".", "/").replace("-", "/")
-            break
+    if "date_of_expiry" not in fields:
+        for idx, key, el in tagged:
+            if key == "expiry_date":
+                val = extract_mangled_date(el["text"])
+                if not val and idx + 1 < len(tagged):
+                    val = extract_mangled_date(tagged[idx + 1][2]["text"])
+                if val:
+                    fields["date_of_expiry"] = val
+                break
 
     # --- Place of Issue (issuing authority) ---
     KNOWN_ISSUERS = [
@@ -567,6 +671,7 @@ _LABEL_FRAG_TOKENS = {
     "noi", "thuong", "tru", "que", "quan", "khai", "sinh", "cu",
     "ho", "va", "ten", "ngay", "nam", "gioi", "tinh", "quoc", "tich",
     "full", "name", "date", "sex", "nationality", "identity", "card",
+    "queguan", "placeoforigin", "placeofresidence", "thurong", "i"
 }
 
 def _strip_all_labels(text: str) -> str:
@@ -576,21 +681,34 @@ def _strip_all_labels(text: str) -> str:
     
     # 1. Remove common multi-word label blocks using regex
     patterns = [
-        r'(?i)place\s+of\s*(origin|residence|birth|ongin)',
-        r'(?i)noi\s+thuong\s+tru',
-        r'(?i)que\s+quan',
-        r'(?i)noi\s+(dang\s+ky\s+)?khai\s+sinh',
-        r'(?i)noi\s+cu\s+tru',
-        r'(?i)ho\s+va\s+ten',
-        r'(?i)full\s+name',
-        r'(?i)ngay\s+sinh',
-        r'(?i)date\s+of\s+birth',
+        r'(?i)place\s*of\s*(origin|residence|birth|ongin)',
+        r'(?i)noi\s*(thuong|thurong)\s*tru',
+        r'(?i)nơi\s*(thường|thuong)\s*trú',
+        r'(?i)que\s*[qg]uan',
+        r'(?i)quê\s*[qg]uán',
+        r'(?i)noi\s*(dang\s*ky\s*)?khai\s*sinh',
+        r'(?i)nơi\s*(đăng\s*ký\s*)?khai\s*sinh',
+        r'(?i)noi\s*cu\s*tru',
+        r'(?i)nơi\s*cư\s*trú',
+        r'(?i)ho\s*va\s*ten',
+        r'(?i)họ\s*và\s*tên',
+        r'(?i)full\s*name',
+        r'(?i)ngay\s*sinh',
+        r'(?i)ngày\s*sinh',
+        r'(?i)date\s*of\s*birth',
+        r'(?i)co\s*gia\s*tri\s*den',
+        r'(?i)có\s*giá\s*trị\s*đến',
+        r'(?i)date\s*of\s*expiry',
+        r'(?i)citizen\s*identity\s*card',
+        r'(?i)can\s*cuoc\s*cong\s*dan',
+        r'(?i)căn\s*cước\s*công\s*dân',
     ]
     for p in patterns:
         text = re.sub(p, '', text)
         
     # 2. Clean up punctuation left behind (like ':', '/', 'I', '-')
-    text = re.sub(r'^[\s/:;\-I|]+', '', text)
+    text = re.sub(r'^[\s/:;\-I|.]+', '', text)
+    text = re.sub(r'[\s/:;\-I|.]+$', '', text)
     
     # 3. Strip individual leftover garbage tokens from the START of the string
     words = text.split()

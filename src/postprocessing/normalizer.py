@@ -87,15 +87,15 @@ def normalize_field(text: str, field_type: str) -> str:
         cleaned_up = cleaned.upper()
         cleaned_up = re.sub(r"[^\w\s]", "", cleaned_up)
         if any(k in cleaned_up for k in ["NU", "NỮ", "NƯ", "FEMALE"]):
-            cleaned = "NU"
+            cleaned = "Nữ"
         elif "NAM" in cleaned_up:
-            cleaned = "NAM"
+            cleaned = "Nam"
         else:
             matched = fuzzy_correct(cleaned_up, STANDARD_GENDERS, score_cutoff=50.0)
             if matched in ("NỮ", "NU", "NƯ"):
-                cleaned = "NU"
+                cleaned = "Nữ"
             elif matched == "NAM":
-                cleaned = "NAM"
+                cleaned = "Nam"
 
     elif field_type == "nationality":
         cleaned = cleaned.upper()
@@ -108,9 +108,31 @@ def normalize_field(text: str, field_type: str) -> str:
         cleaned = fuzzy_correct(cleaned, STANDARD_LICENSE_CLASSES, score_cutoff=70.0)
 
     elif field_type in ("full_name", "owner_name"):
-        cleaned = cleaned.upper()
         cleaned = re.sub(r"[\d\._\-\+\*\?\!]", "", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        try:
+            from src.postprocessing.vn_name_dict import correct_full_name
+            cleaned = correct_full_name(cleaned).upper()
+        except Exception:
+            cleaned = cleaned.upper()
+
+    elif field_type in ("address", "place_of_origin", "place_of_residence", "place_of_birth", "place_of_issue"):
+        try:
+            from src.postprocessing.address_norm import clean_address_string
+            cleaned = clean_address_string(cleaned)
+        except Exception:
+            cleaned = re.sub(r'[:]+', '', cleaned)
+        # Fix CamelCase stuck words (e.g. ApMinhDuy -> Ap Minh Duy)
+        cleaned = re.sub(r'([a-zđàáạảãèéẹẻẽìíịỉĩòóọỏõùúụủũưừứựửữơờớợởỡỳýỵỷỹ])([A-ZĐÀÁẠẢÃÈÉẸẺẼÌÍỊỈĨÒÓỌỎÕÙÚỤỦŨƯỪỨỰỬỮƠỜỚỢỞỠỲÝỴỶỸ])', r'\1 \2', cleaned)
+        cleaned = re.sub(r'\b(Ap|ap)\b', 'Ấp', cleaned)
+        cleaned = re.sub(r'\b(Xa|xa)\b', 'Xã', cleaned)
+        cleaned = re.sub(r'\b(Phuong|phuong)\b', 'Phường', cleaned)
+        cleaned = re.sub(r'\b(Quan|quan)\b', 'Quận', cleaned)
+        cleaned = re.sub(r'\b(Huyen|huyen)\b', 'Huyện', cleaned)
+        cleaned = re.sub(r'\b(Tinh|tinh)\b', 'Tỉnh', cleaned)
+        cleaned = re.sub(r'\s*,\s*', ', ', cleaned)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        cleaned = cleaned.replace(":", "").strip()
 
     return cleaned
 
@@ -127,7 +149,7 @@ def validate_field(text: str, field_type: str) -> bool:
         return bool(re.match(r"^\d{2}/\d{2}/\d{4}$", text))
 
     if field_type == "gender":
-        return text in ("NAM", "NU")
+        return text in ("Nam", "Nữ")
 
     if field_type == "license_class":
         return text in STANDARD_LICENSE_CLASSES

@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field, field_validator
 class GenderEnum(str, Enum):
     NAM = "NAM"
     NU = "NU"
+    Nam = "Nam"
+    Nu = "Nữ"
 
 
 class LicenseClassEnum(str, Enum):

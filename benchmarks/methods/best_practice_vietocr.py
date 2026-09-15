@@ -4,10 +4,10 @@ import numpy as np
 from typing import Dict, Any
 
 from benchmarks.registry import register_method
-from benchmarks.methods.address_norm import normalize_gender_nationality, normalize_address
-from benchmarks.methods.cccd_rules import validate_and_fix_expiry
-from benchmarks.methods.vn_name_dict import correct_full_name
-from benchmarks.methods.layout_graph_parser import layout_parse
+from src.postprocessing.address_norm import normalize_gender_nationality, normalize_address
+from src.postprocessing.cccd_rules import validate_and_fix_expiry
+from src.postprocessing.vn_name_dict import correct_full_name
+from src.postprocessing.layout_parser import layout_parse
 
 # We need access to the raw OCR lines/bboxes
 from src.ocr.engine import OCREngine
@@ -24,6 +24,12 @@ def method_best_practice_vietocr(image: np.ndarray, doc_type: str) -> Dict[str, 
     4. CCCD business rules (expiry date cross-validation)
     5. Gender/Nationality normalization
     """
+    h, w = image.shape[:2]
+    if max(h, w) > 1600:
+        scale = 1600.0 / max(h, w)
+        import cv2
+        image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
     # 1. OCR with bboxes
     elements = _ENGINE.recognize_lines_vietocr_with_bboxes(image)
     
@@ -46,5 +52,20 @@ def method_best_practice_vietocr(image: np.ndarray, doc_type: str) -> Dict[str, 
         fields["place_of_origin"] = normalize_address(fields["place_of_origin"])
     if "place_of_residence" in fields:
         fields["place_of_residence"] = normalize_address(fields["place_of_residence"])
+    if "place_of_birth" in fields:
+        fields["place_of_birth"] = normalize_address(fields["place_of_birth"])
         
     return fields
+
+
+_PIPELINE = None
+
+@register_method("production_pipeline")
+def method_production_pipeline(image: np.ndarray, doc_type: str) -> Dict[str, str]:
+    """Production DocumentOCRPipeline with automatic side detection, normalization and validation."""
+    global _PIPELINE
+    if _PIPELINE is None:
+        from src.pipeline import DocumentOCRPipeline
+        _PIPELINE = DocumentOCRPipeline(ocr_engine=_ENGINE)
+    resp = _PIPELINE.process(image, doc_type)
+    return {k: str(v) for k, v in resp.fields.items() if v is not None}
