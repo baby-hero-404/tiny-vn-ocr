@@ -127,7 +127,7 @@ def normalize_field(text: str, field_type: str) -> str:
         cleaned = re.sub(r'\b(Ap|ap)\b', 'Ấp', cleaned)
         cleaned = re.sub(r'\b(Xa|xa)\b', 'Xã', cleaned)
         cleaned = re.sub(r'\b(Phuong|phuong)\b', 'Phường', cleaned)
-        cleaned = re.sub(r'\b(Quan|quan)\b', 'Quận', cleaned)
+        cleaned = re.sub(r'\b(Quan|quan)\b(?!\s+[Đđ]ình)', 'Quận', cleaned)
         cleaned = re.sub(r'\b(Huyen|huyen)\b', 'Huyện', cleaned)
         cleaned = re.sub(r'\b(Tinh|tinh)\b', 'Tỉnh', cleaned)
         cleaned = re.sub(r'\s*,\s*', ', ', cleaned)

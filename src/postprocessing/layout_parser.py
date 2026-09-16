@@ -27,6 +27,10 @@ def extract_mangled_date(text: str) -> str:
         d_clean = re.sub(r'[^\d]', '', m_loose.group(0))
         if len(d_clean) >= 8:
             return f"{d_clean[:2]}/{d_clean[2:4]}/{d_clean[-4:]}"
+    # Check for 8 contiguous digits DDMMYYYY without slashes (e.g. 29092022 -> 29/09/2022)
+    m_8digits = re.search(r'\b(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])(19\d{2}|20\d{2})\b', clean)
+    if m_8digits:
+        return f"{m_8digits.group(1)}/{m_8digits.group(2)}/{m_8digits.group(3)}"
     return ""
 
 
@@ -67,7 +71,7 @@ BACK_LABELS = {
     "birth_place":  ["khai sinh", "place of birth", "dang ky khai"],
     "issue_date":   ["ngay thang nam", "date of issue", "ngay cap", "date,month"],
     "expiry_date":  ["het han", "date of expiry"],
-    "issuer":       ["bo cong an", "ministry", "cuc canh sat", "cuc truong", "giam doc"],
+    "issuer":       ["bo cong an", "ministry", "cuc canh sat", "cuc truong", "giam doc", "nguyen quoc hung", "quoc hung", "to van hue", "vu xuan dung"],
 }
 
 
@@ -105,29 +109,39 @@ def _classify_line(text: str, label_set: Dict[str, List[str]]) -> Optional[str]:
             score = fuzz.partial_ratio(kw, norm)
             if score > best_score:
                 best_key, best_score = key, score
-    if best_score > 70:
+    if best_score > 80:
         return best_key
     return None
 
 
 def _extract_inline_value(text: str) -> str:
-    """Extract value part from a label line (after : or /)."""
-    # Try colon first
+    """Extract value part from a label line (after :, /, or English label prefix)."""
+    # 1. Try colon first
     if ":" in text:
         val = text.split(":", 1)[1].strip()
         if len(val) > 2:
             return val
-    # Try slash — but only if it separates VN/EN label, not part of address
+
+    # 2. Try slash (separates bilingual VN/EN label, e.g. "Nơi cư trú / Place of residence Quan Đinh Nam")
     parts = text.split("/")
     if len(parts) >= 2:
-        # The last segment after the last "/" might be the value
         last = parts[-1].strip()
-        # Check if it looks like a value (not a label keyword)
+        # Case A: English label prefix followed by value
+        m = re.match(
+            r'(?i)^(?:place\s*of\s*(?:residence|origin|birth|ongin)|full\s*name|date\s*of\s*(?:birth|expiry|issue)|sex|nationality|no\.?)\s*[:;\-]?\s*(.+)$',
+            last
+        )
+        if m:
+            val = m.group(1).strip()
+            if len(val) > 2:
+                return val
+        # Case B: The segment after slash is purely the value (no label keywords)
         norm = _strip_accents(last).lower()
         label_words = {"name", "birth", "origin", "residence", "sex", "nationality",
                        "expiry", "issue", "no", "oforigin", "ofresidence", "ofbirth"}
         if not any(lw in norm for lw in label_words) and len(last) > 2:
             return last
+
     return ""
 
 
@@ -234,16 +248,32 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
         if key == "full_name":
             # Check inline value
             inline = _extract_inline_value(el["text"])
-            if inline and len(inline) > 3 and not re.search(r'\d', inline):
+            if inline and len(inline) > 3 and not re.search(r'\d', inline) and not _is_garbage(inline):
                 fields["full_name"] = inline
             else:
-                # Value is the next line below
-                if idx + 1 < len(tagged):
-                    next_el = tagged[idx + 1][2]
-                    candidate = next_el["text"].strip()
-                    # Must look like a name: mostly uppercase letters, no dates
-                    if len(candidate) > 3 and not re.search(r'\d{2}/\d{2}', candidate):
-                        fields["full_name"] = candidate
+                label_xmin = el["bbox"][0]
+                label_ymin = el["bbox"][1]
+                label_ymax = el["bbox"][3]
+                best_cand = None
+                for j in range(idx + 1, min(idx + 6, len(tagged))):
+                    j_key, j_el = tagged[j][1], tagged[j][2]
+                    if j_key is not None:
+                        continue # Skip other section labels (e.g. dob)
+                    cand_text = j_el["text"].strip()
+                    if _is_garbage(cand_text) or re.search(r'\d', cand_text):
+                        continue
+                    cand_xmin = j_el["bbox"][0]
+                    cand_ymin = j_el["bbox"][1]
+                    # Must align horizontally within reasonable column offset
+                    if abs(cand_xmin - label_xmin) > 120:
+                        continue
+                    # Must be positioned immediately below the label
+                    if cand_ymin < label_ymin - 5 or cand_ymin > label_ymax + 100:
+                        continue
+                    best_cand = cand_text
+                    break
+                if best_cand:
+                    fields["full_name"] = best_cand
             break
 
     # --- Date of Birth ---
@@ -395,8 +425,21 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
 
             parts.append(text)
 
-        address = " ".join(parts).strip()
-        address = address.replace(" ,", ",").strip()
+        # Smart join address parts: insert comma if previous part was a unit or next part starts an admin unit
+        if parts:
+            address = parts[0].strip().rstrip(",")
+            for p in parts[1:]:
+                p_clean = p.strip()
+                if not p_clean:
+                    continue
+                prev_is_unit = bool(re.search(r'\b(Ấp|Thôn|Bản|Khu\s+phố|Tổ|Số)\b', address, re.IGNORECASE))
+                curr_starts_unit = bool(re.match(r'^(?:Ấp|Xã|Phường|P\b|P\.|TT\b|TT\.|TX\b|TX\.|TP\b|TP\.|Quận|Q\b|Q\.|Huyện|H\b|H\.|Tỉnh)\b', p_clean, re.IGNORECASE))
+                if prev_is_unit or curr_starts_unit or address.endswith(","):
+                    address = f"{address}, {p_clean.lstrip(',')}"
+                else:
+                    address = f"{address} {p_clean}"
+        else:
+            address = ""
         from src.postprocessing.address_norm import clean_address_string, deduplicate_address_segments
         address = clean_address_string(address)
         address = deduplicate_address_segments(address)
@@ -446,7 +489,7 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
 # Step 4: CCCD Back-side layout parser
 # ============================================================
 
-def parse_cccd_back(elements: List[Dict]) -> Dict[str, str]:
+def parse_cccd_back(elements: List[Dict], image=None, ocr_engine=None) -> Dict[str, str]:
     """Parse CCCD back side using bbox layout."""
     fields: Dict[str, str] = {}
     if not elements:
@@ -543,6 +586,31 @@ def parse_cccd_back(elements: List[Dict]) -> Dict[str, str]:
                 except (ValueError, IndexError):
                     pass
 
+    # Fallback for date_of_issue using targeted CLAHE if image is available
+    if "date_of_issue" not in fields and image is not None:
+        try:
+            import cv2
+            from rapidocr_onnxruntime import RapidOCR
+            h, w = image.shape[:2]
+            top_half = image[:int(h * 0.6), :]
+            gray = cv2.cvtColor(top_half, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            cl_bgr = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+            rocr = RapidOCR()
+            clahe_res, _ = rocr(cl_bgr)
+            for r in clahe_res or []:
+                val = extract_mangled_date(r[1])
+                if val and val != fields.get("date_of_expiry"):
+                    try:
+                        yr = int(val.split("/")[-1])
+                        if 2014 <= yr <= 2029:
+                            fields["date_of_issue"] = val
+                            break
+                    except (ValueError, IndexError):
+                        pass
+        except Exception:
+            pass
+
     # --- Date of Expiry ---
     if "date_of_expiry" not in fields:
         for idx, key, el in tagged:
@@ -570,7 +638,7 @@ def parse_cccd_back(elements: List[Dict]) -> Dict[str, str]:
             norm = _strip_accents(raw_text).upper()
             if "BO CONG AN" in norm:
                 fields["place_of_issue"] = "BỘ CÔNG AN"
-            elif "CANH SAT" in norm or "CUC CANH" in norm:
+            elif any(k in norm for k in ["CANH SAT", "CUC CANH", "QUOC HUNG", "VAN HUE", "XUAN DUNG"]):
                 fields["place_of_issue"] = "CỤC CẢNH SÁT QUẢN LÝ HÀNH CHÍNH VỀ TRẬT TỰ XÃ HỘI"
             else:
                 cleaned = re.sub(r'(?i)(CỤC\s*TRƯỞNG|CUC\s*TRUONG|GIÁM\s*ĐỐC|GIAM\s*DOC|CỤC\s*TRƯỜNG)', '', raw_text).strip()
@@ -597,6 +665,8 @@ _GARBAGE_PATTERNS = [
     re.compile(r'(?i)date of ?expiry'),
     re.compile(r'(?i)citizen identity'),
     re.compile(r'(?i)(IDVNM|VNMCCS|BUICK)'),          # MRZ zone
+    re.compile(r'(?i)\b(ctrl|ctri|alt|shift|esc|tab|caps|f\d+|enter|backspace|delete|copy|edit|exit|save|blend|layer|mask)\b'), # keyboard noise
+    re.compile(r'[+<>=~*^|\\]'),                      # shortcut / symbol noise
 ]
 
 # Common OCR garbage words (accent-stripped, lowercase) from noisy card edges
@@ -668,8 +738,8 @@ def _looks_like_address(text: str) -> bool:
 _LABEL_FRAG_TOKENS = {
     "place", "of", "origin", "birth", "residence", "ongin", "ace", "ce",
     "esidence", "irth", "oforigin", "ofresidence", "ofbirth",
-    "noi", "thuong", "tru", "que", "quan", "khai", "sinh", "cu",
-    "ho", "va", "ten", "ngay", "nam", "gioi", "tinh", "quoc", "tich",
+    "noi", "thuong", "tru", "que", "khai", "cu",
+    "ho", "va", "ten", "ngay", "gioi",
     "full", "name", "date", "sex", "nationality", "identity", "card",
     "queguan", "placeoforigin", "placeofresidence", "thurong", "i"
 }
@@ -681,6 +751,8 @@ def _strip_all_labels(text: str) -> str:
     
     # 1. Remove common multi-word label blocks using regex
     patterns = [
+        r'(?i)\b(?:[nr]ơi|[nr]oi|rồi)\s+(?:thương|thường|thuong|thurong)\s+(?:trú|tru|trui)\b',
+        r'(?i)\b(?:place|phaco|placo|pace)\s+of\s+(?:residence|nadence|redence)\b',
         r'(?i)place\s*of\s*(origin|residence|birth|ongin)',
         r'(?i)noi\s*(thuong|thurong)\s*tru',
         r'(?i)nơi\s*(thường|thuong)\s*trú',
@@ -729,7 +801,7 @@ def layout_parse(elements: List[Dict], doc_type: str, image=None, ocr_engine=Non
     if doc_type in ("cccd", "cccd_front"):
         return parse_cccd_front(elements, image=image, ocr_engine=ocr_engine)
     elif doc_type == "cccd_back":
-        return parse_cccd_back(elements)
+        return parse_cccd_back(elements, image=image, ocr_engine=ocr_engine)
     elif doc_type == "cccd_auto":
         # Auto-detect side from content
         all_text = " ".join(el["text"] for el in elements).lower()
@@ -739,7 +811,7 @@ def layout_parse(elements: List[Dict], doc_type: str, image=None, ocr_engine=Non
         front_score = sum(1 for k in front_kw if k in norm)
         back_score = sum(1 for k in back_kw if k in norm)
         if back_score > front_score:
-            return parse_cccd_back(elements)
+            return parse_cccd_back(elements, image=image, ocr_engine=ocr_engine)
         else:
             return parse_cccd_front(elements, image=image, ocr_engine=ocr_engine)
     return {}

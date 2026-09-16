@@ -49,7 +49,7 @@ VN_GIVEN_NAMES = [
     "Nga", "Ngân", "Nghi", "Nhung", "Oanh", "Phạm", "Phương", "Phượng", "Phụng",
     "Quyên", "Quỳnh", "Thảo", "Thi", "Thu", "Thương", "Thư", "Tiên", "Trang",
     "Trâm", "Trân", "Trúc", "Tâm", "Uyên", "Vân", "Vy", "Yến", "Xuân",
-    "Nhi", "Hạnh", "Hiền", "Tuyết", "Mai", "Thi", "Thắm", "Trinh",
+    "Nhi", "Hạnh", "Hiền", "Tuyết", "Mai", "Thi", "Thắm", "Trinh", "Trình",
     "Hoài", "Linh", "Bùi", "Minh", "Duy", "Hòa", "Tú", "Đức", "Trí", "Hoàng",
     "Việt", "Quang", "Phương", "Thành", "Kiên", "Khánh", "Cường", "Giang",
     "Hương", "Hà", "Hải", "Tuấn", "Tiến", "Tùng", "Khoa", "Phong", "Thắng",

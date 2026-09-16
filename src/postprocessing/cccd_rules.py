@@ -135,7 +135,7 @@ def _compute_expiry(dob: datetime, hint_year: int = None, issue_date_str: str = 
         ref_year = issue_year if (issue_year and issue_year >= 2015) else current_year
         for age in CCCD_EXPIRY_AGES:
             exp_year = dob.year + age
-            if exp_year >= ref_year:
+            if exp_year > ref_year:
                 break
         else:
             exp_year = dob.year + 60

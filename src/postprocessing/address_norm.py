@@ -52,6 +52,16 @@ def clean_address_string(raw: str) -> str:
     # 3c. Admin abbreviation glued to the name with a hyphen instead of a space
     # (e.g. "TP-Sóc Trăng" -> "TP Sóc Trăng").
     s = re.sub(r"\b(TP|TX|TT|Q|H|P)\s*-\s*", r"\1 ", s)
+
+    # 3d. Normalize abbreviation dots (e.g. "TT." -> "TT", "TP." -> "TP", "P." -> "P")
+    s = re.sub(r"\b(TP|TX|TT|Q|H|P)\.\s*", r"\1 ", s)
+
+    # 3e. Insert comma before administrative units if preceded by a word without a comma
+    # (e.g. "Ấp Chợ Cũ TT Mỹ Xuyên" -> "Ấp Chợ Cũ, TT Mỹ Xuyên")
+    s = re.sub(r'(?<=[^\s,])\s+(?=(?:TT|TX|TP|Xã|Phường|Thị trấn|Quận|Huyện)\b)', ', ', s)
+
+    # 3f. Fix isolated administrative abbreviations (e.g. ", TT, " -> ", TT ")
+    s = re.sub(r',\s*(TP|TX|TT|Q|H|P)\s*,\s*', r', \1 ', s)
     
     # 4. Remove isolated pipes or bilingual separator tokens
     s = re.sub(r"\s+[|I]\s+", " ", s)
@@ -59,6 +69,8 @@ def clean_address_string(raw: str) -> str:
 
     # 5. Clean common bilingual labels that might appear anywhere without colon
     bilingual_patterns = [
+        r"(?i)\b(?:[nr]ơi|[nr]oi|rồi)\s+(?:thương|thường|thuong|thurong)\s+(?:trú|tru|trui)\b",
+        r"(?i)\b(?:place|phaco|placo|pace)\s+of\s+(?:residence|nadence|redence)\b",
         r"(?i)place\s*of\s*(origin|residence|birth|ongin)",
         r"(?i)noi\s*(thuong|thurong)\s*tru",
         r"(?i)nơi\s*(thường|thuong)\s*trú",
@@ -206,6 +218,7 @@ class HierarchicalAddressNormalizer:
         raw_address = re.sub(r'\bMình\s+Duy\b', 'Minh Duy', raw_address)
         raw_address = re.sub(r'\b(Họa Tự|Hóa Tú|Họa Tu|Hóa Tu)\b', 'Hòa Tú', raw_address)
         raw_address = re.sub(r'\b(Cần Thó|Cần Thờ|Cân Thơ|Cân Tho|Can Tho)\b', 'Cần Thơ', raw_address)
+        raw_address = re.sub(r'\bĐinh\s+Nam\b', 'Đình Nam', raw_address)
 
         raw_address = re.sub(r'\s*,\s*', ', ', raw_address)
         raw_address = re.sub(r'\s+', ' ', raw_address).strip()
@@ -229,8 +242,10 @@ class HierarchicalAddressNormalizer:
                 first_db = db_segs[0]
                 
                 # Check if the first segment aligns structurally
-                align_score = fuzz.partial_ratio(_strip_accents(first_db), _strip_accents(first_raw))
-                if align_score < 50:
+                # Use full ratio (not partial) to avoid false matches
+                # like "Tân Tiến" ≈ "Tiên Lữ" (partial=73, ratio=53)
+                align_score = fuzz.ratio(_strip_accents(first_db), _strip_accents(first_raw))
+                if align_score < 65:
                     continue
                     
                 score = match[1]
@@ -270,7 +285,8 @@ class HierarchicalAddressNormalizer:
             clean_prefix = []
             for p in prefix_parts:
                 norm_p = _strip_accents(p).strip()
-                if not any(norm_p == db_s or fuzz.ratio(norm_p, db_s) > 85 for db_s in db_segs_lower):
+                is_unit_prefix = bool(re.match(r'^(?:ap|thon|ban|to|khu|so)\b', norm_p))
+                if not any(norm_p == db_s or (fuzz.ratio(norm_p, db_s) > 90 and not is_unit_prefix) for db_s in db_segs_lower):
                     clean_prefix.append(p)
             prefix_parts = clean_prefix
                 
@@ -328,8 +344,20 @@ def reconcile_residence_with_origin(fields: Dict[str, str]) -> Dict[str, str]:
     if best_score < 60:
         return fields
 
-    prefix_parts = parts[:best_idx]
-    fields["place_of_residence"] = ", ".join(prefix_parts + [origin]) if prefix_parts else origin
+    # If parts[best_idx] is a ward/commune/town (e.g. TT..., Phường..., Xã...)
+    # but origin doesn't have it, don't erase the ward! Keep it in prefix_parts.
+    matched_seg = parts[best_idx]
+    norm_matched = _strip_accents(matched_seg).lower()
+    is_ward_level = bool(re.match(r'^(?:tt|tx|phuong|xa|thi tran|p\b|p\.)\b', norm_matched))
+    origin_has_ward = norm_matched in origin_norm
+
+    if is_ward_level and not origin_has_ward:
+        prefix_parts = parts[:best_idx + 1]
+    else:
+        prefix_parts = parts[:best_idx]
+
+    res = ", ".join(prefix_parts + [origin]) if prefix_parts else origin
+    fields["place_of_residence"] = deduplicate_address_segments(res)
     return fields
 
 

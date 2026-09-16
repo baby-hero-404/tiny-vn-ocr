@@ -36,7 +36,11 @@ class DocumentOCRPipeline:
         norm = _strip_accents(all_text)
 
         front_kw = ["ho va ten", "full name", "ho ten", "ngay sinh", "date of birth", "que quan", "place of origin", "quoc tich", "nationality", "gioi tinh", "sex", "so / no", "so:"]
-        back_kw = ["khai sinh", "noi dang ky khai sinh", "cu tru", "noi cu tru", "cuc truong", "giam doc", "canh sat", "bo cong an", "ministry", "ngon tro", "dac diem"]
+        back_kw = [
+            "khai sinh", "noi dang ky khai sinh", "cu tru", "noi cu tru",
+            "cuc truong", "giam doc", "canh sat", "bo cong an", "ministry",
+            "ngon tro", "dac diem", "<<", "idvnm", "quoc hung", "van hue", "xuan dung"
+        ]
 
         front_score = sum(1 for kw in front_kw if kw in norm)
         back_score = sum(1 for kw in back_kw if kw in norm)
@@ -54,10 +58,10 @@ class DocumentOCRPipeline:
         if image is None or image.size == 0:
             raise ValueError("Invalid or empty input image provided.")
 
-        # Fast downscale if image is too large (e.g. camera photo > 1600px)
+        # Fast downscale if image is excessively large (e.g. 48MP camera photo > 3600px)
         h, w = image.shape[:2]
-        if max(h, w) > 1600:
-            scale = 1600.0 / max(h, w)
+        if max(h, w) > 3600:
+            scale = 3600.0 / max(h, w)
             import cv2
             image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
