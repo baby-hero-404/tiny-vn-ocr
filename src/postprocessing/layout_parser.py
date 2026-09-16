@@ -202,6 +202,27 @@ def _refine_name_with_vision(crop: Optional[np.ndarray], name_text: str, ocr_eng
     return " ".join(refined_words)
 
 
+def _refine_inline_with_vision(image: Optional[np.ndarray], bbox: List[float], inline_text: str, full_text: str, ocr_engine: Optional[Any]) -> str:
+    """Refine inline value OCR using high-resolution subcrop of the value portion."""
+    if image is None or ocr_engine is None or not inline_text or len(inline_text) < 3:
+        return inline_text
+    try:
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        w = x2 - x1
+        if w < 30 or (y2 - y1) < 8:
+            return inline_text
+        ratio = len(inline_text) / max(len(full_text), 1)
+        crop_x1 = max(x1, int(x1 + w * (1.0 - ratio * 1.15)))
+        sub = image[y1:y2, crop_x1:x2]
+        pred = ocr_engine.recognize_crop_vietocr(sub).strip()
+        clean_pred = _extract_inline_value(pred) or pred
+        if _strip_accents(clean_pred).lower() == _strip_accents(inline_text).lower():
+            return clean_pred
+    except Exception:
+        pass
+    return inline_text
+
+
 # ============================================================
 # Step 3: CCCD Front-side layout parser
 # ============================================================
@@ -610,6 +631,8 @@ def parse_cccd_back(elements: List[Dict], image=None, ocr_engine=None) -> Dict[s
             parts = []
             inline = _extract_inline_value(el["text"])
             if inline and not _is_garbage(inline):
+                if image is not None and ocr_engine is not None and "bbox" in el:
+                    inline = _refine_inline_with_vision(image, el["bbox"], inline, el["text"], ocr_engine)
                 parts.append(inline)
             # Collect below until next label
             for j in range(idx + 1, len(tagged)):
@@ -631,6 +654,8 @@ def parse_cccd_back(elements: List[Dict], image=None, ocr_engine=None) -> Dict[s
             parts = []
             inline = _extract_inline_value(el["text"])
             if inline and not _is_garbage(inline):
+                if image is not None and ocr_engine is not None and "bbox" in el:
+                    inline = _refine_inline_with_vision(image, el["bbox"], inline, el["text"], ocr_engine)
                 parts.append(inline)
             for j in range(idx + 1, len(tagged)):
                 if tagged[j][1] is not None:

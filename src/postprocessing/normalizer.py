@@ -70,6 +70,35 @@ def fuzzy_correct(text: str, dictionary: List[str], score_cutoff: float = 60.0) 
     return text
 
 
+KNOWN_QUAN_DISTRICTS = [
+    "Ba Đình", "Bình Thuỷ", "Bình Thạnh", "Bình Tân", "Bắc Từ Liêm", "Cái Răng",
+    "Cầu Giấy", "Cẩm Lệ", "Dương Kinh", "Gò Vấp", "Hai Bà Trưng", "Hoàn Kiếm",
+    "Hoàng Mai", "Hà Đông", "Hải An", "Hải Châu", "Hồng Bàng", "Kiến An",
+    "Liên Chiểu", "Long Biên", "Lê Chân", "Nam Từ Liêm", "Ngô Quyền", "Ngũ Hành Sơn",
+    "Ninh Kiều", "Phú Nhuận", "Sơn Trà", "Thanh Khê", "Thanh Xuân", "Thốt Nốt",
+    "Tân Bình", "Tân Phú", "Tây Hồ", "Ô Môn", "Đống Đa", "Đồ Sơn",
+]
+
+
+def normalize_quan_district(text: str) -> str:
+    """Normalize 'Quan' to 'Quận' only when it refers to a genuine administrative district (by number or official name)."""
+    import unicodedata
+    # 1. Numbered districts: Quan 1 -> Quận 1
+    text = re.sub(r'\b[Qq]uan\s+(\d+)\b', r'Quận \1', text)
+    # 2. Named official districts
+    for d in sorted(KNOWN_QUAN_DISTRICTS, key=len, reverse=True):
+        d_words = d.split()
+        word_patterns = []
+        for w in d_words:
+            nfkd = unicodedata.normalize("NFD", w)
+            clean_w = "".join(c for c in nfkd if not unicodedata.combining(c)).replace("đ", "d").replace("Đ", "D")
+            word_patterns.append(f"(?:{re.escape(w)}|{re.escape(clean_w)})")
+        district_pat = r"\s+".join(word_patterns)
+        pattern = r"\b[Qq]uan\s+(" + district_pat + r")\b"
+        text = re.sub(pattern, f"Quận {d}", text, flags=re.IGNORECASE)
+    return text
+
+
 def normalize_field(text: str, field_type: str) -> str:
     """Normalize OCR text based on field type rules."""
     if not text:
@@ -127,7 +156,7 @@ def normalize_field(text: str, field_type: str) -> str:
         cleaned = re.sub(r'\b(Ap|ap)\b', 'Ấp', cleaned)
         cleaned = re.sub(r'\b(Xa|xa)\b', 'Xã', cleaned)
         cleaned = re.sub(r'\b(Phuong|phuong)\b', 'Phường', cleaned)
-        cleaned = re.sub(r'\b(Quan|quan)\b(?!\s+[Đđ]ình)', 'Quận', cleaned)
+        cleaned = normalize_quan_district(cleaned)
         cleaned = re.sub(r'\b(Huyen|huyen)\b', 'Huyện', cleaned)
         cleaned = re.sub(r'\b(Tinh|tinh)\b', 'Tỉnh', cleaned)
         cleaned = re.sub(r'\s*,\s*', ', ', cleaned)

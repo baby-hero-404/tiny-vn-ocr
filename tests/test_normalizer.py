@@ -65,3 +65,11 @@ def test_address_colon_and_label_cleaning():
     res = normalize_address("Quê quán: Thạnh Phú, Mỹ Xuyên, Sóc Trăng, Thạnh Phú, Mỹ Xuyên, Sóc Trăng")
     assert ":" not in res
     assert res == "Thạnh Phú, Mỹ Xuyên, Sóc Trăng"
+
+
+def test_normalize_quan_district():
+    assert normalize_field("Quan 1, TP Ho Chi Minh", "address") == "Quận 1, TP Ho Chi Minh"
+    assert normalize_field("Quan Ba Dinh, Ha Noi", "address") == "Quận Ba Đình, Ha Noi"
+    assert normalize_field("Quan Đình Nam, Tân Tiến, Hưng Yên", "address") == "Quan Đình Nam, Tân Tiến, Hưng Yên"
+    assert normalize_field("Quan Dinh Nam", "address") == "Quan Dinh Nam"
+

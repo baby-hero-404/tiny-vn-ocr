@@ -207,6 +207,8 @@ class HierarchicalAddressNormalizer:
                                         w_variants.extend([f"TT {w_name}", f"TT.{w_name}"])
 
                                 for wv in w_variants:
+                                    for pv in p_variants:
+                                        paths_set.add(f"{wv}, {pv}")
                                     for dv in d_variants:
                                         for pv in p_variants:
                                             paths_set.add(f"{wv}, {dv}, {pv}")
@@ -227,11 +229,11 @@ class HierarchicalAddressNormalizer:
         raw_address = re.sub(r'\b(Ap|ap)\b', 'Ấp', raw_address)
         raw_address = re.sub(r'\b(Xa|xa)\b', 'Xã', raw_address)
         
-        # Step 3: Fix common OCR diacritic errors in Vietnamese addresses
-        raw_address = re.sub(r'\bMình\s+Duy\b', 'Minh Duy', raw_address)
-        raw_address = re.sub(r'\b(Họa Tự|Hóa Tú|Họa Tu|Hóa Tu)\b', 'Hòa Tú', raw_address)
-        raw_address = re.sub(r'\b(Cần Thó|Cần Thờ|Cân Thơ|Cân Tho|Can Tho)\b', 'Cần Thơ', raw_address)
-        raw_address = re.sub(r'\bĐinh\s+Nam\b', 'Đình Nam', raw_address)
+        # Step 3: Fix general OCR diacritic confusion for common place syllables
+        # 'Mình' (pronoun) is an OCR confusion for 'Minh' (bright, standard place/name root)
+        raw_address = re.sub(r'\bMình\b', 'Minh', raw_address)
+        # 'Đinh' followed by communal directions/units is 'Đình' (communal house)
+        raw_address = re.sub(r'\bĐinh\s+(Nam|Bắc|Đông|Tây|Thôn|Làng|Thượng|Hạ|Trung)\b', r'Đình \1', raw_address)
 
         raw_address = re.sub(r'\s*,\s*', ', ', raw_address)
         raw_address = re.sub(r'\s+', ' ', raw_address).strip()
