@@ -4,7 +4,7 @@ import numpy as np
 from typing import Dict, Any
 
 from benchmarks.registry import register_method
-from src.postprocessing.address_norm import normalize_gender_nationality, normalize_address
+from src.postprocessing.address_norm import normalize_gender_nationality, normalize_address, reconcile_residence_with_origin
 from src.postprocessing.cccd_rules import validate_and_fix_expiry
 from src.postprocessing.vn_name_dict import correct_full_name
 from src.postprocessing.layout_parser import layout_parse
@@ -52,6 +52,8 @@ def method_best_practice_vietocr(image: np.ndarray, doc_type: str) -> Dict[str, 
         fields["place_of_origin"] = normalize_address(fields["place_of_origin"])
     if "place_of_residence" in fields:
         fields["place_of_residence"] = normalize_address(fields["place_of_residence"])
+    if doc_type in ("cccd", "cccd_front"):
+        fields = reconcile_residence_with_origin(fields)
     if "place_of_birth" in fields:
         fields["place_of_birth"] = normalize_address(fields["place_of_birth"])
         

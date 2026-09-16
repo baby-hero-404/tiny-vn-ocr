@@ -2,6 +2,7 @@
 
 import re
 import unicodedata
+import numpy as np
 from typing import Dict, List, Any, Optional, Tuple
 
 from rapidfuzz import fuzz
@@ -128,7 +129,7 @@ def _extract_inline_value(text: str) -> str:
         last = parts[-1].strip()
         # Case A: English label prefix followed by value
         m = re.match(
-            r'(?i)^(?:place\s*of\s*(?:residence|origin|birth|ongin)|full\s*name|date\s*of\s*(?:birth|expiry|issue)|sex|nationality|no\.?)\s*[:;\-]?\s*(.+)$',
+            r'(?i)^(?:(?:p[li1a]ace|piace|placo|phaco|pace)?\s*(?:of|ool)?\s*(?:residence|redence|sedines|sedence|origin|birth|ongin)|ofresidence|oforigin|ofbirth|full\s*name|date\s*of\s*(?:birth|expiry|issue)|sex|nationality|no\.?)\s*[:;\-]?\s*(.+)$',
             last
         )
         if m:
@@ -143,6 +144,62 @@ def _extract_inline_value(text: str) -> str:
             return last
 
     return ""
+
+
+def _refine_name_with_vision(crop: Optional[np.ndarray], name_text: str, ocr_engine: Optional[Any]) -> str:
+    """Refine Vietnamese full name diacritics using targeted high-resolution vision sub-crops.
+    
+    Long text lines squashed into 32px height by Seq2Seq models can blur or truncate stacked diacritics
+    (such as circumflex + tilde: Ễ). This optical verifier crops candidate words with ambiguous accents
+    and runs a high-resolution sub-crop check, accepting optical refinement only when the base word matches.
+    """
+    if crop is None or not name_text or ocr_engine is None:
+        return name_text
+    words = name_text.split()
+    if not words:
+        return name_text
+
+    H, W = crop.shape[:2]
+    if W < 20 or H < 8:
+        return name_text
+
+    import cv2
+    L = sum(len(w) for w in words) + len(words) - 1
+
+    refined_words = []
+    pos = 0
+    for w in words:
+        start_char = pos
+        end_char = pos + len(w)
+        pos = end_char + 1
+
+        norm_w = _strip_accents(w).lower()
+        # Words that could have stacked diacritics in Vietnamese names
+        # (e.g. circumflex vowels: ê, â, ô, or ambiguous base words like nguyen)
+        needs_check = any(c in w.lower() for c in ["ê", "â", "ô", "ư", "ơ"]) or norm_w == "nguyen"
+        if not needs_check:
+            refined_words.append(w)
+            continue
+
+        x1 = max(0, int((start_char - 0.5) / L * W))
+        x2 = min(W, int((end_char + 0.5) / L * W))
+        sub = crop[:, x1:x2]
+        if sub.shape[1] < 10 or sub.shape[0] < 8:
+            refined_words.append(w)
+            continue
+
+        padded = cv2.copyMakeBorder(sub, 4, 2, 4, 4, cv2.BORDER_CONSTANT, value=[255, 255, 255])
+        try:
+            sub_pred = ocr_engine.recognize_crop_vietocr(padded).strip()
+            # If the vision sub-crop cleanly recognized the exact same base word with different diacritics
+            if _strip_accents(sub_pred).lower() == norm_w and sub_pred != w:
+                refined_words.append(sub_pred.upper() if w.isupper() else sub_pred)
+            else:
+                refined_words.append(w)
+        except Exception:
+            refined_words.append(w)
+
+    return " ".join(refined_words)
 
 
 # ============================================================
@@ -187,6 +244,14 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
     from src.postprocessing.validator import FieldValidator
     
     cand = id_match.group(0) if id_match else None
+    if not (cand and FieldValidator.is_valid_cccd_id(cand)):
+        # Cross-reference with RapidOCR results which don't hallucinate extra digits
+        rapid_full = " ".join(el.get("rapid_text", "") for el in lines)
+        m_rapid = re.search(r'\b\d{12}\b', rapid_full)
+        if not m_rapid:
+            m_rapid = re.search(r'\d{12}', rapid_full.replace(" ", ""))
+        if m_rapid and FieldValidator.is_valid_cccd_id(m_rapid.group(0)):
+            cand = m_rapid.group(0)
     
     if cand and FieldValidator.is_valid_cccd_id(cand):
         fields["id_number"] = cand
@@ -247,14 +312,16 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
     for idx, key, el in tagged:
         if key == "full_name":
             # Check inline value
+            cand_name = None
+            cand_crop = None
             inline = _extract_inline_value(el["text"])
             if inline and len(inline) > 3 and not re.search(r'\d', inline) and not _is_garbage(inline):
-                fields["full_name"] = inline
+                cand_name = inline
+                cand_crop = el.get("crop")
             else:
                 label_xmin = el["bbox"][0]
                 label_ymin = el["bbox"][1]
                 label_ymax = el["bbox"][3]
-                best_cand = None
                 for j in range(idx + 1, min(idx + 6, len(tagged))):
                     j_key, j_el = tagged[j][1], tagged[j][2]
                     if j_key is not None:
@@ -270,10 +337,12 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
                     # Must be positioned immediately below the label
                     if cand_ymin < label_ymin - 5 or cand_ymin > label_ymax + 100:
                         continue
-                    best_cand = cand_text
+                    cand_name = cand_text
+                    cand_crop = j_el.get("crop")
                     break
-                if best_cand:
-                    fields["full_name"] = best_cand
+            if cand_name:
+                cand_name = _refine_name_with_vision(cand_crop, cand_name, ocr_engine)
+                fields["full_name"] = cand_name
             break
 
     # --- Date of Birth ---
@@ -379,14 +448,26 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
 
         parts = []
         
+        def _restore_slash(val: str, rapid_raw: Optional[str]) -> str:
+            if not val or not rapid_raw:
+                return val
+            for m in re.finditer(r'\b(\d{1,4})/(\d{1,4})\b', rapid_raw):
+                n1, n2 = m.group(1), m.group(2)
+                mangled = f"{n1}1{n2}"
+                if mangled in val:
+                    val = val.replace(mangled, f"{n1}/{n2}")
+            return val
+
         # Extract inline value by stripping all label keywords
         # If line has colon, value is strictly after colon. Otherwise check if non-label address text remains.
         if ":" in start_el["text"]:
             after_colon = _strip_all_labels(start_el["text"].split(":", 1)[1]).strip()
+            after_colon = _restore_slash(after_colon, start_el.get("rapid_text"))
             if after_colon and len(after_colon) > 3 and not _is_garbage(after_colon):
                 parts.append(after_colon)
         else:
             text_clean = _strip_all_labels(start_el["text"]).strip()
+            text_clean = _restore_slash(text_clean, start_el.get("rapid_text"))
             if text_clean and len(text_clean) > 3 and not _is_garbage(text_clean):
                 norm_clean = _strip_accents(text_clean).lower()
                 if norm_clean not in ("que quan", "queguan", "place of origin", "placeoforigin", "noi thuong tru", "place of residence", "noi thurong tru"):
@@ -415,6 +496,8 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
                 continue
 
             text = j_el["text"].strip()
+            text = _restore_slash(text, j_el.get("rapid_text"))
+            text = re.sub(r'\b[ÁÂA]p\b', 'Ấp', text)
             if _is_garbage(text):
                 continue
 
@@ -432,8 +515,8 @@ def parse_cccd_front(elements: List[Dict], image=None, ocr_engine=None) -> Dict[
                 p_clean = p.strip()
                 if not p_clean:
                     continue
-                prev_is_unit = bool(re.search(r'\b(Ấp|Thôn|Bản|Khu\s+phố|Tổ|Số)\b', address, re.IGNORECASE))
-                curr_starts_unit = bool(re.match(r'^(?:Ấp|Xã|Phường|P\b|P\.|TT\b|TT\.|TX\b|TX\.|TP\b|TP\.|Quận|Q\b|Q\.|Huyện|H\b|H\.|Tỉnh)\b', p_clean, re.IGNORECASE))
+                prev_is_unit = bool(re.search(r'\b(Ấp|Áp|Âp|Ap|Thôn|Bản|Khu\s+phố|Tổ|Khóm|Số|Đường|Phố)\b', address, re.IGNORECASE))
+                curr_starts_unit = bool(re.match(r'^(?:Ấp|Áp|Âp|Ap|Xã|Phường|P\b|P\.|TT\b|TT\.|TX\b|TX\.|TP\b|TP\.|Quận|Q\b|Q\.|Huyện|H\b|H\.|Tỉnh)\b', p_clean, re.IGNORECASE))
                 if prev_is_unit or curr_starts_unit or address.endswith(","):
                     address = f"{address}, {p_clean.lstrip(',')}"
                 else:
@@ -586,28 +669,46 @@ def parse_cccd_back(elements: List[Dict], image=None, ocr_engine=None) -> Dict[s
                 except (ValueError, IndexError):
                     pass
 
-    # Fallback for date_of_issue using targeted CLAHE if image is available
+    # Fallback for date_of_issue using targeted crop and CLAHE if image is available
     if "date_of_issue" not in fields and image is not None:
         try:
             import cv2
             from rapidocr_onnxruntime import RapidOCR
-            h, w = image.shape[:2]
-            top_half = image[:int(h * 0.6), :]
-            gray = cv2.cvtColor(top_half, cv2.COLOR_BGR2GRAY)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            cl_bgr = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
             rocr = RapidOCR()
-            clahe_res, _ = rocr(cl_bgr)
-            for r in clahe_res or []:
-                val = extract_mangled_date(r[1])
-                if val and val != fields.get("date_of_expiry"):
-                    try:
-                        yr = int(val.split("/")[-1])
-                        if 2014 <= yr <= 2029:
+            h, w = image.shape[:2]
+
+            # Strategy 1: Targeted strip directly above CANH SAT / issuer / director
+            issuer_el = next((el for _, key, el in tagged if key == "issuer" or any(k in _strip_accents(el["text"]).upper() for k in ["CANH SAT", "CUC TRUONG", "QUOC HUNG", "VAN HUE", "TRAT TU"])), None)
+            if issuer_el:
+                c_ymin = int(issuer_el["bbox"][1])
+                c_xmin = max(0, int(issuer_el["bbox"][0] - 150))
+                c_xmax = min(w, int(issuer_el["bbox"][2] + 250))
+                crop_above = image[max(0, c_ymin - 250):min(h, c_ymin + 20), c_xmin:c_xmax]
+                if crop_above.size > 0:
+                    res_above, _ = rocr(crop_above)
+                    for r in res_above or []:
+                        val = extract_mangled_date(r[1])
+                        if val and val != fields.get("date_of_expiry"):
                             fields["date_of_issue"] = val
                             break
-                    except (ValueError, IndexError):
-                        pass
+
+            # Strategy 2: Targeted CLAHE on top half if still not found
+            if "date_of_issue" not in fields:
+                top_half = image[:int(h * 0.6), :]
+                gray = cv2.cvtColor(top_half, cv2.COLOR_BGR2GRAY)
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                cl_bgr = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2BGR)
+                clahe_res, _ = rocr(cl_bgr)
+                for r in clahe_res or []:
+                    val = extract_mangled_date(r[1])
+                    if val and val != fields.get("date_of_expiry"):
+                        try:
+                            yr = int(val.split("/")[-1])
+                            if 2014 <= yr <= 2029:
+                                fields["date_of_issue"] = val
+                                break
+                        except (ValueError, IndexError):
+                            pass
         except Exception:
             pass
 
@@ -638,7 +739,7 @@ def parse_cccd_back(elements: List[Dict], image=None, ocr_engine=None) -> Dict[s
             norm = _strip_accents(raw_text).upper()
             if "BO CONG AN" in norm:
                 fields["place_of_issue"] = "BỘ CÔNG AN"
-            elif any(k in norm for k in ["CANH SAT", "CUC CANH", "QUOC HUNG", "VAN HUE", "XUAN DUNG"]):
+            elif any(k in norm for k in ["CANH SAT", "CUC CANH", "QUOC HUNG", "VAN HUE", "XUAN DUNG", "TRAT TU"]):
                 fields["place_of_issue"] = "CỤC CẢNH SÁT QUẢN LÝ HÀNH CHÍNH VỀ TRẬT TỰ XÃ HỘI"
             else:
                 cleaned = re.sub(r'(?i)(CỤC\s*TRƯỞNG|CUC\s*TRUONG|GIÁM\s*ĐỐC|GIAM\s*DOC|CỤC\s*TRƯỜNG)', '', raw_text).strip()
@@ -650,6 +751,15 @@ def parse_cccd_back(elements: List[Dict], image=None, ocr_engine=None) -> Dict[s
                 else:
                     fields["place_of_issue"] = raw_text
             break
+
+    # Authoritative fallback for chip-based cards or clear C06 markers
+    if fields.get("place_of_issue") not in KNOWN_ISSUERS:
+        all_back_text = " ".join(f"{el.get('text', '')} {el.get('rapid_text', '')}" for el in lines)
+        norm_back = _strip_accents(all_back_text).upper()
+        if any(k in norm_back for k in ["BO CONG AN", "MINISTRY OF PUBLIC SECURITY"]):
+            fields["place_of_issue"] = "BỘ CÔNG AN"
+        elif any(k in norm_back for k in ["IDVNM", "<<", "QUOC HUNG", "VAN HUE", "XUAN DUNG", "CANH SAT", "TRAT TU XA HOI", "CUC CANH"]):
+            fields["place_of_issue"] = "CỤC CẢNH SÁT QUẢN LÝ HÀNH CHÍNH VỀ TRẬT TỰ XÃ HỘI"
 
     return fields
 
@@ -665,7 +775,7 @@ _GARBAGE_PATTERNS = [
     re.compile(r'(?i)date of ?expiry'),
     re.compile(r'(?i)citizen identity'),
     re.compile(r'(?i)(IDVNM|VNMCCS|BUICK)'),          # MRZ zone
-    re.compile(r'(?i)\b(ctrl|ctri|alt|shift|esc|tab|caps|f\d+|enter|backspace|delete|copy|edit|exit|save|blend|layer|mask)\b'), # keyboard noise
+    re.compile(r'(?i)\b(ctrl|ctri|crtl|alt|shift|shif|esc|tab|caps|f\d+|enter|backspace|delete|copy|edit|exit|save|blend|layer|mask)[\d+a-z]*'), # keyboard noise
     re.compile(r'[+<>=~*^|\\]'),                      # shortcut / symbol noise
 ]
 
@@ -749,10 +859,13 @@ def _strip_all_labels(text: str) -> str:
     if not text:
         return text
     
+    # Strip boundary duplicate digit from misread colon attached to residence/origin label
+    text = re.sub(r'(?i)\b(residence|origin|birth|tru|quán|quan)[.:;\s\-]*([12])(?=\s*\2\d+)', r'\1 ', text)
+    
     # 1. Remove common multi-word label blocks using regex
     patterns = [
-        r'(?i)\b(?:[nr]ơi|[nr]oi|rồi)\s+(?:thương|thường|thuong|thurong)\s+(?:trú|tru|trui)\b',
-        r'(?i)\b(?:place|phaco|placo|pace)\s+of\s+(?:residence|nadence|redence)\b',
+        r'(?i)\b(?:[nr]ói|[nr]ơi|[nr]oi|rồi)\s+(?:thương|thường|thuong|thurong)\s+(?:trú|tru|trui)\b',
+        r'(?i)\b(?:place|phaco|placo|pace|placeool)\s*(?:of|ool)?\s*(?:residence|nadence|redence|sedines|sedence)\b',
         r'(?i)place\s*of\s*(origin|residence|birth|ongin)',
         r'(?i)noi\s*(thuong|thurong)\s*tru',
         r'(?i)nơi\s*(thường|thuong)\s*trú',

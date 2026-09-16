@@ -45,6 +45,9 @@ def clean_address_string(raw: str) -> str:
     # 3. Strip bilingual slash: keep slash only between numbers/alphanumeric house codes (e.g. 217/4, 3/2)
     s = re.sub(r"(?<!\d)/|/(?!\d)", " ", s)
 
+    # 3a. Strip boundary duplicate digit from misread colon attached to residence/origin label (e.g. "residence2217" -> "residence 217")
+    s = re.sub(r'(?i)\b(residence|origin|birth|tru|quán|quan)[.:;\s\-]*([12])(?=\s*\2\d+)', r'\1 ', s)
+
     # 3b. Common OCR diacritic misread: "Áp" (not a Vietnamese address term) is
     # almost always a misread of "Ấp" (hamlet/village unit prefix).
     s = re.sub(r"\bÁp\b", "Ấp", s)
@@ -63,14 +66,15 @@ def clean_address_string(raw: str) -> str:
     # 3f. Fix isolated administrative abbreviations (e.g. ", TT, " -> ", TT ")
     s = re.sub(r',\s*(TP|TX|TT|Q|H|P)\s*,\s*', r', \1 ', s)
     
-    # 4. Remove isolated pipes or bilingual separator tokens
+    # 4. Remove isolated pipes or bilingual separator tokens and keyboard noise
     s = re.sub(r"\s+[|I]\s+", " ", s)
     s = re.sub(r"[|~_^*@#\$%]+", " ", s)
+    s = re.sub(r'(?i)\b(ctr[li1]|crtl|shif[ti1]|al[ti1])[\d+a-z]*\b', '', s)
 
     # 5. Clean common bilingual labels that might appear anywhere without colon
     bilingual_patterns = [
-        r"(?i)\b(?:[nr]ơi|[nr]oi|rồi)\s+(?:thương|thường|thuong|thurong)\s+(?:trú|tru|trui)\b",
-        r"(?i)\b(?:place|phaco|placo|pace)\s+of\s+(?:residence|nadence|redence)\b",
+        r"(?i)\b(?:[nr]ói|[nr]ơi|[nr]oi|rồi)\s+(?:thương|thường|thuong|thurong)\s+(?:trú|tru|trui)\b",
+        r"(?i)\b(?:place|phaco|placo|pace|placeool)\s*(?:of|ool)?\s*(?:residence|nadence|redence|sedines|sedence)\b",
         r"(?i)place\s*of\s*(origin|residence|birth|ongin)",
         r"(?i)noi\s*(thuong|thurong)\s*tru",
         r"(?i)nơi\s*(thường|thuong)\s*trú",
@@ -160,43 +164,52 @@ class HierarchicalAddressNormalizer:
             
             paths_set = set()
             
-            def add_aliases(path, path_with_type):
-                paths_set.add(path)
-                paths_set.add(path_with_type)
-                # Create shorthand aliases
-                # e.g., "Thành phố Sóc Trăng" -> "TP Sóc Trăng"
-                replacements = [
-                    ("Thành phố ", "TP "),
-                    ("Thành phố ", "TP."),
-                    ("Thị xã ", "TX "),
-                    ("Thị xã ", "TX."),
-                    ("Thị trấn ", "TT "),
-                    ("Thị trấn ", "TT."),
-                    ("Quận ", "Q. "),
-                    ("Quận ", "Q"),
-                    ("Phường ", "P. "),
-                    ("Phường ", "P"),
-                    ("Huyện ", "H. "),
-                    ("Tỉnh ", "")
-                ]
-                for old, new in replacements:
-                    if old in path_with_type:
-                        paths_set.add(path_with_type.replace(old, new))
-                        paths_set.add(path_with_type.replace(old, new).replace(" ,", ",").strip())
-
             for p_code, p_data in tree.items():
-                paths_set.add(p_data["name"])
-                add_aliases(p_data["name"], p_data["name_with_type"])
+                p_name = p_data["name"]
+                p_wt = p_data["name_with_type"]
+                p_variants = [p_name, p_wt]
+                if p_wt.startswith("Thành phố "):
+                    p_variants.append(f"TP {p_name}")
+
+                for pv in p_variants:
+                    paths_set.add(pv)
+
                 if "quan-huyen" in p_data:
                     for d_code, d_data in p_data["quan-huyen"].items():
-                        paths_set.add(d_data["name"])
-                        paths_set.add(f"{d_data['name']}, {p_data['name']}")
-                        add_aliases(f"{d_data['name']}, {p_data['name']}", f"{d_data['name_with_type']}, {p_data['name_with_type']}")
+                        d_name = d_data["name"]
+                        d_wt = d_data["name_with_type"]
+                        d_variants = [d_wt, d_name]
+                        if d_wt.startswith("Thành phố "):
+                            d_variants.extend([f"TP {d_name}", f"TP.{d_name}"])
+                        elif d_wt.startswith("Thị xã "):
+                            d_variants.extend([f"TX {d_name}", f"TX.{d_name}"])
+                        elif d_wt.startswith("Thị trấn "):
+                            d_variants.extend([f"TT {d_name}", f"TT.{d_name}"])
+                        elif d_wt.startswith("Quận "):
+                            d_variants.extend([f"Q {d_name}", f"Q. {d_name}"])
+                        elif d_wt.startswith("Huyện "):
+                            d_variants.extend([f"H. {d_name}"])
+
+                        for dv in d_variants:
+                            for pv in p_variants:
+                                paths_set.add(f"{dv}, {pv}")
+
                         if "xa-phuong" in d_data:
                             for w_code, w_data in d_data["xa-phuong"].items():
-                                paths_set.add(w_data["name"])
-                                paths_set.add(f"{w_data['name']}, {d_data['name']}, {p_data['name']}")
-                                add_aliases(f"{w_data['name']}, {d_data['name']}, {p_data['name']}", f"{w_data['name_with_type']}, {d_data['name_with_type']}, {p_data['name_with_type']}")
+                                w_name = w_data["name"]
+                                w_wt = w_data["name_with_type"]
+                                w_is_num = w_name.isdigit()
+                                if w_is_num:
+                                    w_variants = [f"Phường {w_name}", f"P{w_name}", f"P. {w_name}", f"P.{w_name}"]
+                                else:
+                                    w_variants = [w_name, w_wt]
+                                    if w_wt.startswith("Thị trấn "):
+                                        w_variants.extend([f"TT {w_name}", f"TT.{w_name}"])
+
+                                for wv in w_variants:
+                                    for dv in d_variants:
+                                        for pv in p_variants:
+                                            paths_set.add(f"{wv}, {dv}, {pv}")
 
             self.admin_paths = list(paths_set)
 
@@ -241,10 +254,13 @@ class HierarchicalAddressNormalizer:
                 db_segs = [p.strip() for p in match[0].split(",")]
                 first_db = db_segs[0]
                 
-                # Check if the first segment aligns structurally
-                # Use full ratio (not partial) to avoid false matches
-                # like "Tân Tiến" ≈ "Tiên Lữ" (partial=73, ratio=53)
                 align_score = fuzz.ratio(_strip_accents(first_db), _strip_accents(first_raw))
+                first_raw_words = _strip_accents(first_raw).split()
+                first_db_words = _strip_accents(first_db).split()
+                if len(first_raw_words) > len(first_db_words):
+                    trailing_str = " ".join(first_raw_words[-len(first_db_words):])
+                    trailing_score = fuzz.ratio(_strip_accents(first_db), trailing_str)
+                    align_score = max(align_score, trailing_score)
                 if align_score < 65:
                     continue
                     
@@ -328,6 +344,18 @@ def reconcile_residence_with_origin(fields: Dict[str, str]) -> Dict[str, str]:
     parts = [p.strip() for p in residence.split(",") if p.strip()]
     if not parts:
         return fields
+
+    # If residence already contains a complete, verified administrative tail matching an admin path,
+    # do NOT overwrite its specific abbreviations/wording with origin!
+    if len(parts) >= 3:
+        tail = ", ".join(parts[-3:])
+        tail_2 = ", ".join(parts[-2:])
+        if _NORMALIZER.admin_paths:
+            m_tail = process.extractOne(tail, _NORMALIZER.admin_paths, scorer=_unaccented_scorer, score_cutoff=90.0)
+            if not m_tail:
+                m_tail = process.extractOne(tail_2, _NORMALIZER.admin_paths, scorer=_unaccented_scorer, score_cutoff=90.0)
+            if m_tail:
+                return fields
 
     # Find the split point whose suffix best matches origin as a whole.
     best_idx, best_score = len(parts), 0.0

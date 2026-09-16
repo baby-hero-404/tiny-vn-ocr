@@ -57,6 +57,9 @@ def _should_refine_with_vietocr(text: str) -> bool:
     # Fixed national banners
     if any(b in norm for b in _FIXED_BANNERS):
         return False
+    # Identity card number lines (9-12 digits) - RapidOCR is much more reliable at pure digits than VietOCR
+    if re.search(r'(?:so|no|s6|số)[.:/\s]*\d{9,12}', norm) or re.search(r'\b\d{9,12}\b', stripped):
+        return False
     # If it has a colon with substantive letters after it (inline value) -> refine!
     if ":" in stripped:
         val = stripped.split(":", 1)[1].strip()
@@ -297,9 +300,9 @@ class OCREngine:
                     x_coords = [p[0] for p in box]
                     y_coords = [p[1] for p in box]
 
-                    padding_y_top = 6
-                    padding_y_bottom = 4
-                    padding_x = 3
+                    padding_y_top = 2
+                    padding_y_bottom = 2
+                    padding_x = 2
 
                     xmin = max(0, int(min(x_coords)) - padding_x)
                     xmax = min(image.shape[1], int(max(x_coords)) + padding_x)
@@ -326,6 +329,7 @@ class OCREngine:
 
                         elements.append({
                             "text": text,
+                            "rapid_text": rapid_text,
                             "bbox": [tight_xmin, tight_ymin, tight_xmax, tight_ymax],
                             "center": [
                                 (tight_xmin + tight_xmax) / 2,

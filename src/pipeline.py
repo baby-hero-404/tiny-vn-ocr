@@ -65,6 +65,13 @@ class DocumentOCRPipeline:
             import cv2
             image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
+        # Perspective dewarping (straighten skewed cards)
+        try:
+            from src.preprocessing.dewarp import dewarp_card
+            image = dewarp_card(image)
+        except Exception as e:
+            logger.debug(f"Dewarping bypassed: {e}")
+
         doc_key = document_type.lower()
         if doc_key == "cccd_front":
             doc_key = "cccd"
@@ -80,6 +87,15 @@ class DocumentOCRPipeline:
                 from src.postprocessing.vn_name_dict import correct_full_name
                 from src.postprocessing.cccd_rules import validate_and_fix_expiry
                 from src.postprocessing.address_norm import normalize_gender_nationality, normalize_address, reconcile_residence_with_origin
+                from src.postprocessing.qr_parser import scan_and_parse_cccd_qr
+
+                # QR Code Scan (Instant ground truth for front-side chip CCCD)
+                qr_fields = None
+                if doc_key in ("cccd", "cccd_front", "id_card", "identity", "cccd_auto"):
+                    try:
+                        qr_fields = scan_and_parse_cccd_qr(image)
+                    except Exception as e:
+                        logger.debug(f"QR code scan bypassed: {e}")
 
                 # 1. OCR with bboxes
                 elements = self.ocr_engine.recognize_lines_vietocr_with_bboxes(image)
@@ -109,6 +125,12 @@ class DocumentOCRPipeline:
                         extracted_fields["place_of_birth"] = normalize_address(extracted_fields["place_of_birth"])
                     if "place_of_residence" in extracted_fields:
                         extracted_fields["place_of_residence"] = normalize_address(extracted_fields["place_of_residence"])
+
+                # Override/enrich with authoritative QR data if available
+                if qr_fields:
+                    for qk, qv in qr_fields.items():
+                        if qv:
+                            extracted_fields[qk] = qv
 
                 engines_used = {"rapidocr", "vietocr"}
                 field_confidences = [0.95] * len(extracted_fields)

@@ -84,8 +84,8 @@ def main():
     res_opt = run_eval(opt_pipeline, dataset, "Thread-Tuned Pipeline (PyTorch threads=2)")
 
     # 3. Test Dual-Side (Front + Back)
-    front_img = cv2.imread("resources/cccd/mtruoc.jpg")
-    back_img = cv2.imread("resources/cccd/msau.jpg")
+    front_img = cv2.imread("resources/cccd/cccd_front_06.jpg")
+    back_img = cv2.imread("resources/cccd/cccd_back_04.jpg")
 
     print("\n--- Testing Dual-Sided Processing ---")
     # Sequential
